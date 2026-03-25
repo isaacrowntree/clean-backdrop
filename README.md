@@ -26,7 +26,7 @@ Local web interface with sliders, live preview, and before/after comparison.
 
 ```bash
 pip install -r requirements.txt
-python app_v2.py
+python app.py
 # Open http://localhost:5000
 ```
 

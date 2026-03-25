@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-Clean Backdrop - Web UI
-Local web interface with sliders for tuning detection and previewing results.
+Clean Backdrop v2 - Three-technique approach:
+1. LaMa: small blemishes only (marks, wrinkles, scuffs)
+2. Shadow lift: brighten cast shadows to match surrounding wall
+3. Floor replace: synthetic gradient from wall color
+
+Each has independent controls. Preview shows all three layered.
 """
 
 import os
 import io
 import base64
 import json
+import re
+import subprocess
 import tempfile
 import numpy as np
 import cv2
@@ -22,17 +28,18 @@ LAMA_MODEL_PATH = os.path.join(LAMA_MODEL_DIR, "big-lama.pt")
 
 app = Flask(__name__)
 
-# Global state for loaded models and current image
 state = {
     "img": None,
     "img_path": None,
     "subject_mask": None,
     "bg_mask": None,
     "floor_mask": None,
+    "floor_start_row": None,
     "lama_model": None,
     "device": None,
-    "preview_size": 1200,  # max dimension for preview
+    "preview_size": 1200,
     "icc_profile": None,
+    "last_result": None,
 }
 
 
@@ -44,7 +51,7 @@ def download_lama():
     urllib.request.urlretrieve(LAMA_MODEL_URL, LAMA_MODEL_PATH)
 
 
-def get_lama_model():
+def get_lama():
     if state["lama_model"] is None:
         download_lama()
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -54,279 +61,267 @@ def get_lama_model():
     return state["lama_model"], state["device"]
 
 
-def pad_to_modulo(img, mod):
+def pad8(img):
     h, w = img.shape[:2]
-    pad_h = (mod - h % mod) % mod
-    pad_w = (mod - w % mod) % mod
-    if pad_h == 0 and pad_w == 0:
+    ph = (8 - h % 8) % 8
+    pw = (8 - w % 8) % 8
+    if ph == 0 and pw == 0:
         return img, (0, 0)
     if img.ndim == 3:
-        return np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode='reflect'), (pad_h, pad_w)
-    return np.pad(img, ((0, pad_h), (0, pad_w)), mode='reflect'), (pad_h, pad_w)
+        return np.pad(img, ((0, ph), (0, pw), (0, 0)), mode='reflect'), (ph, pw)
+    return np.pad(img, ((0, ph), (0, pw)), mode='reflect'), (ph, pw)
 
 
-def inpaint_lama(image, mask, model, device):
+def run_lama(image, mask, model, device):
     h, w = image.shape[:2]
-    img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    mask_f = (mask > 128).astype(np.float32)
-    img_rgb, (pad_h, pad_w) = pad_to_modulo(img_rgb, 8)
-    mask_f, _ = pad_to_modulo(mask_f, 8)
-    img_t = torch.from_numpy(img_rgb).permute(2, 0, 1).unsqueeze(0).to(device)
-    mask_t = torch.from_numpy(mask_f).unsqueeze(0).unsqueeze(0).to(device)
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    mf = (mask > 128).astype(np.float32)
+    rgb, (ph, pw) = pad8(rgb)
+    mf, _ = pad8(mf)
     with torch.no_grad():
-        out = model(img_t, mask_t)
+        out = model(
+            torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(device),
+            torch.from_numpy(mf).unsqueeze(0).unsqueeze(0).to(device),
+        )
     out = out[0].permute(1, 2, 0).cpu().numpy()
     out = np.clip(out * 255, 0, 255).astype(np.uint8)
-    if pad_h > 0:
-        out = out[:-pad_h]
-    if pad_w > 0:
-        out = out[:, :-pad_w]
+    if ph > 0: out = out[:-ph]
+    if pw > 0: out = out[:, :-pw]
     return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
 
 
-def resize_for_preview(img, max_dim):
+def preview_resize(img):
     h, w = img.shape[:2]
-    scale = min(max_dim / max(h, w), 1.0)
-    if scale < 1.0:
-        return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA), scale
-    return img, 1.0
+    s = min(state["preview_size"] / max(h, w), 1.0)
+    if s < 1.0:
+        return cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+    return img
 
 
-def img_to_b64(img_bgr):
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    pil = Image.fromarray(img_rgb)
+def to_b64(img_bgr):
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(rgb)
     buf = io.BytesIO()
-    save_kwargs = {}
+    kw = {}
     if state.get("icc_profile"):
-        save_kwargs["icc_profile"] = state["icc_profile"]
-    pil.save(buf, format='JPEG', quality=90, **save_kwargs)
+        kw["icc_profile"] = state["icc_profile"]
+    pil.save(buf, format='JPEG', quality=92, **kw)
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def detect_floor_boundary(img, bg_mask):
+def find_file(filename):
+    for root in ["/mnt/c/Users", "/mnt/d/Photos", "/mnt/d", "/mnt/e"]:
+        if not os.path.isdir(root):
+            continue
+        try:
+            r = subprocess.run(["find", root, "-name", filename, "-type", "f", "-maxdepth", "8"],
+                               capture_output=True, text=True, timeout=10)
+            matches = [l.strip() for l in r.stdout.strip().split('\n') if l.strip()]
+            if matches:
+                return matches[0]
+        except:
+            continue
+    return None
+
+
+def detect_floor(img, bg_mask):
     h, w = img.shape[:2]
     floor_mask = np.zeros((h, w), dtype=np.uint8)
-    wall_top, wall_bot = h // 4, h // 2
-    wall_sample = bg_mask[wall_top:wall_bot, :] > 0
-    if np.sum(wall_sample) < 100:
-        return floor_mask
-    wall_color = np.median(img[wall_top:wall_bot][wall_sample], axis=0)
-    floor_top = int(h * 0.85)
-    floor_sample = bg_mask[floor_top:, :] > 0
-    if np.sum(floor_sample) < 100:
-        return floor_mask
-    floor_color = np.median(img[floor_top:][floor_sample], axis=0)
-    color_diff = np.sqrt(np.sum((wall_color.astype(float) - floor_color.astype(float)) ** 2))
-    if color_diff < 60:
-        return floor_mask
+    floor_start = h
+
+    wt, wb = h // 4, h // 2
+    ws = bg_mask[wt:wb, :] > 0
+    if np.sum(ws) < 100:
+        return floor_mask, floor_start
+    wall_color = np.median(img[wt:wb][ws], axis=0)
+
+    ft = int(h * 0.85)
+    fs = bg_mask[ft:, :] > 0
+    if np.sum(fs) < 100:
+        return floor_mask, floor_start
+    floor_color = np.median(img[ft:][fs], axis=0)
+
+    diff = np.sqrt(np.sum((wall_color.astype(float) - floor_color.astype(float)) ** 2))
+    if diff < 60:
+        return floor_mask, floor_start
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    bottom_half = gray[h // 2:, :]
-    bg_bottom = bg_mask[h // 2:, :]
-    row_means = []
-    for r in range(bottom_half.shape[0]):
-        pixels = bottom_half[r][bg_bottom[r] > 0]
-        row_means.append(np.mean(pixels) if len(pixels) > 0 else 0)
-    row_means = np.array(row_means)
-    if len(row_means) > 20:
-        smoothed = cv2.GaussianBlur(row_means.reshape(-1, 1), (1, 21), 0).flatten()
-        gradient = np.diff(smoothed)
-        if len(gradient) > 0 and np.min(gradient) < -0.5:
-            threshold = np.min(gradient) * 0.3
-            candidates = np.where(gradient < threshold)[0]
-            if len(candidates) > 0:
-                floor_start = h // 2 + candidates[0]
+    bh = gray[h // 2:, :]
+    bm = bg_mask[h // 2:, :]
+    means = []
+    for r in range(bh.shape[0]):
+        px = bh[r][bm[r] > 0]
+        means.append(np.mean(px) if len(px) > 0 else 0)
+    means = np.array(means)
+    if len(means) > 20:
+        sm = cv2.GaussianBlur(means.reshape(-1, 1), (1, 21), 0).flatten()
+        grad = np.diff(sm)
+        if len(grad) > 0 and np.min(grad) < -0.5:
+            cands = np.where(grad < np.min(grad) * 0.3)[0]
+            if len(cands) > 0:
+                floor_start = h // 2 + cands[0]
                 floor_mask[floor_start:, :] = bg_mask[floor_start:, :]
-    return floor_mask
+
+    return floor_mask, floor_start
 
 
-def detect_blemishes(img, bg_mask, floor_mask, sensitivity=15, shadow_strength=20,
-                     scuff_strength=12, detect_dark_bars=True, detect_edges=True):
+# ── Technique 1: Detect small blemishes for LaMa ──
+def detect_marks(img, bg_mask, floor_mask, sensitivity=15):
+    """Only wrinkles, scuffs, marks - NOT shadows, NOT floor."""
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    work_mask = bg_mask.copy()
-    work_mask[floor_mask > 0] = 0
+    work = bg_mask.copy()
+    work[floor_mask > 0] = 0
 
-    # Wrinkles
-    low_freq = cv2.GaussianBlur(gray, (0, 0), sigmaX=8)
-    high_freq = np.abs(gray - low_freq)
-    wrinkles = ((high_freq > sensitivity) & (work_mask > 0)).astype(np.uint8)
+    # High-freq wrinkles
+    lo = cv2.GaussianBlur(gray, (0, 0), sigmaX=8)
+    hi = np.abs(gray - lo)
+    marks = ((hi > sensitivity) & (work > 0)).astype(np.uint8)
 
-    # Shadows
-    work_float = gray * work_mask.astype(np.float32)
-    work_weight = work_mask.astype(np.float32)
-    blur_k = min(max(h, w) // 6, 501)
-    blur_k = blur_k + (1 - blur_k % 2)
-    blurred = cv2.GaussianBlur(work_float, (blur_k, blur_k), 0)
-    blurred_w = cv2.GaussianBlur(work_weight, (blur_k, blur_k), 0)
-    blurred_w = np.maximum(blurred_w, 1e-6)
-    expected = blurred / blurred_w
-    shadow_deviation = expected - gray
-    shadows = ((shadow_deviation > shadow_strength) & (work_mask > 0)).astype(np.uint8)
+    # Scuffs (local dark spots)
+    local = cv2.GaussianBlur(gray, (0, 0), sigmaX=15)
+    scuffs = ((local - gray > sensitivity * 0.8) & (work > 0)).astype(np.uint8)
+    bright = ((gray - local > sensitivity * 0.8) & (work > 0)).astype(np.uint8)
 
-    # Scuffs
-    local_mean = cv2.GaussianBlur(gray, (0, 0), sigmaX=15)
-    scuffs = ((local_mean - gray > scuff_strength) & (work_mask > 0)).astype(np.uint8)
-    local_mean_large = cv2.GaussianBlur(gray, (0, 0), sigmaX=40)
-    scuffs_large = ((local_mean_large - gray > scuff_strength * 1.3) & (work_mask > 0)).astype(np.uint8)
-    bright_marks = ((gray - local_mean > scuff_strength) & (work_mask > 0)).astype(np.uint8)
+    # Seam lines
+    edges = cv2.Canny(gray.astype(np.uint8), 15, 50)
+    seams = ((edges > 0) & (work > 0)).astype(np.uint8)
+    sobelx = np.abs(cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3))
+    vseams = ((sobelx > 15) & (work > 0)).astype(np.uint8)
 
-    # Dark bars / baseboards / dark edges
-    dark_bars = np.zeros((h, w), dtype=np.uint8)
-    if detect_dark_bars:
-        wall_brightness = np.percentile(gray[work_mask > 0], 70) if np.sum(work_mask) > 100 else 200
-
-        # Anything much darker than the wall
-        dark_bars = ((gray < wall_brightness * 0.6) & (work_mask > 0)).astype(np.uint8)
-
-        # Catch baseboards/bars at the wall-floor boundary
-        # These sit IN the floor zone but are actually wall imperfections
-        if np.sum(floor_mask) > 0:
-            # Expand upward from floor into wall zone
-            floor_edge_up = cv2.dilate(floor_mask,
-                                        cv2.getStructuringElement(cv2.MORPH_RECT, (1, 80)), iterations=1)
-            floor_edge_up = np.clip(floor_edge_up.astype(np.int16) - floor_mask.astype(np.int16), 0, 1).astype(np.uint8)
-            boundary_dark = ((gray < wall_brightness * 0.7) & (floor_edge_up > 0) & (bg_mask > 0)).astype(np.uint8)
-            dark_bars = np.clip(dark_bars + boundary_dark, 0, 1).astype(np.uint8)
-
-            # Scan the entire floor zone for dark horizontal bars/baseboards
-            # These are much darker than the floor and span the width
-            floor_pixels = gray[floor_mask > 0]
-            if len(floor_pixels) > 100:
-                floor_brightness = np.median(floor_pixels)
-                # Anything in the floor zone that's very dark = baseboard/bar
-                baseboard = ((gray < min(wall_brightness * 0.5, floor_brightness * 0.5)) &
-                             (floor_mask > 0) & (bg_mask > 0)).astype(np.uint8)
-                # Dilate to cover full bar width
-                baseboard = cv2.dilate(baseboard,
-                                        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 15)), iterations=2)
-                baseboard = baseboard & bg_mask  # still only on background
-                dark_bars = np.clip(dark_bars + baseboard, 0, 1).astype(np.uint8)
-
-        # Top and bottom edges of the background (rigging, dark borders)
-        edge_zone_h = max(int(h * 0.05), 20)
-        top_dark = ((gray[:edge_zone_h, :] < wall_brightness * 0.7) &
-                    (bg_mask[:edge_zone_h, :] > 0)).astype(np.uint8)
-        dark_bars[:edge_zone_h, :] = np.clip(
-            dark_bars[:edge_zone_h, :] + top_dark, 0, 1).astype(np.uint8)
-
-    # Seam lines / edges
-    edge_marks = np.zeros((h, w), dtype=np.uint8)
-    if detect_edges:
-        # Lower thresholds to catch subtle seams
-        edges = cv2.Canny(gray.astype(np.uint8), 15, 50)
-        edge_marks = ((edges > 0) & (work_mask > 0)).astype(np.uint8)
-
-        # Also use Sobel for vertical seams specifically (common in wall backdrops)
-        sobelx = np.abs(cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3))
-        vert_seams = ((sobelx > 15) & (work_mask > 0)).astype(np.uint8)
-        edge_marks = np.clip(edge_marks + vert_seams, 0, 1).astype(np.uint8)
-
-    combined = np.clip(
-        wrinkles + shadows + scuffs + scuffs_large + bright_marks + edge_marks + dark_bars,
-        0, 1
-    ).astype(np.uint8)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    combined = cv2.dilate(combined, kernel, iterations=2)
+    combined = np.clip(marks + scuffs + bright + seams + vseams, 0, 1).astype(np.uint8)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    combined = cv2.dilate(combined, k, iterations=1)
     combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE,
-                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)), iterations=2)
-
-    # Exclude floor EXCEPT for detected dark bars (baseboards)
-    floor_exclude = floor_mask.copy()
-    if detect_dark_bars:
-        floor_exclude[dark_bars > 0] = 0  # don't exclude bars from the mask
-    combined[floor_exclude > 0] = 0
-
+                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1)
+    combined[floor_mask > 0] = 0
     return combined * 255
 
 
-def generate_seamless_backdrop(img, bg_mask, subject_mask, floor_mask, backdrop_color=None, floor_darken=0.75):
+# ── Technique 2: Shadow lift ──
+def compute_shadow_lift(img, bg_mask, floor_mask, subject_mask, strength=0.7):
     """
-    Generate a synthetic seamless paper backdrop.
-    - Clean wall color with subtle center-bright vignette
-    - Smooth gradient to darker floor (simulates light falloff on paper)
-    - No visible wall-floor seam (simulates the paper curve)
-    - Preserves subject contact shadows
+    Lift shadows by blending toward clean wall color.
+    Compares every wall pixel directly to the clean wall brightness -
+    NOT to a blur that includes the shadow.
     """
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    work = bg_mask.copy()
+    work[floor_mask > 0] = 0
 
-    # Determine the clean wall color
-    if backdrop_color is None:
-        wall_mask = bg_mask.copy()
-        wall_mask[floor_mask > 0] = 0
-        wall_pixels = img[wall_mask > 0]
-        if len(wall_pixels) > 100:
-            brightness = np.mean(wall_pixels, axis=1)
-            bright = wall_pixels[brightness > np.percentile(brightness, 75)]
-            if len(bright) > 10:
-                backdrop_color = np.median(bright, axis=0).astype(np.float32)
-            else:
-                backdrop_color = np.array([240, 240, 240], dtype=np.float32)
-        else:
-            backdrop_color = np.array([240, 240, 240], dtype=np.float32)
+    if np.sum(work) < 100:
+        return img.copy()
 
-    # Create the synthetic backdrop
-    backdrop = np.zeros((h, w, 3), dtype=np.float32)
+    # Find the clean wall color from the brightest background pixels
+    wall_pixels = img[work > 0]
+    brightness = np.mean(wall_pixels, axis=1)
+    bright_pixels = wall_pixels[brightness > np.percentile(brightness, 80)]
+    if len(bright_pixels) < 10:
+        return img.copy()
+    clean_wall = np.median(bright_pixels, axis=0).astype(np.float32)  # BGR
+    clean_brightness = np.mean(clean_wall)
 
-    # Vertical gradient: wall color at top, gradually darker toward bottom
-    for y in range(h):
-        t = y / h  # 0 at top, 1 at bottom
-        # Smooth S-curve: stays bright for wall, then darkens for floor
-        # The "curve" point is where wall meets floor
-        curve_point = 0.65  # 65% of image is wall, bottom 35% is floor gradient
-        if t < curve_point:
-            darken = 1.0  # wall: full brightness
-        else:
-            floor_t = (t - curve_point) / (1.0 - curve_point)
-            darken = 1.0 - (1.0 - floor_darken) * (floor_t ** 0.8)  # gradual darkening
-        backdrop[y, :] = backdrop_color * darken
+    # Shadow amount: how much darker is each pixel compared to clean wall
+    # This is a direct comparison, not relative to a blur
+    darkness = clean_brightness - gray
+    max_shadow_depth = clean_brightness * 0.5  # shadows up to 50% darker than clean wall
+    shadow_amount = np.clip(darkness / max(max_shadow_depth, 1), 0, 1)
+    shadow_amount = shadow_amount * strength
 
-    # Subtle radial vignette: brighter in center, slightly darker at edges
-    cy, cx = h * 0.4, w * 0.5  # center slightly above middle (where light hits)
-    Y, X = np.mgrid[0:h, 0:w]
-    dist = np.sqrt(((X - cx) / (w * 0.6)) ** 2 + ((Y - cy) / (h * 0.7)) ** 2)
-    vignette = 1.0 - np.clip(dist, 0, 1) * 0.15  # subtle: max 15% darkening at edges
-    backdrop *= vignette[:, :, np.newaxis]
-    backdrop = np.clip(backdrop, 0, 255)
+    # Shadow amount applies everywhere on the wall - let the gradient do the work
+    # Darker pixels naturally get lifted more, lighter ones less = gradient preserved
+    shadow_amount[work == 0] = 0
 
-    # Composite subject over synthetic backdrop
-    # Use the original subject mask (not dilated) for tight edge
-    subject_f = subject_mask.astype(np.float32) / 255.0
-    # Small feather for natural edge
-    subject_f = cv2.GaussianBlur(subject_f, (5, 5), 0)
-    subject_3ch = subject_f[:, :, np.newaxis]
+    # Very wide smooth to include the full shadow with soft edges
+    blur_size = max(int(min(h, w) * 0.06), 51)
+    blur_size = blur_size + (1 - blur_size % 2)
+    shadow_amount = cv2.GaussianBlur(shadow_amount, (blur_size, blur_size), 0)
 
-    result = (subject_3ch * img.astype(np.float32) +
-              (1 - subject_3ch) * backdrop)
+    # Blend toward clean wall color (preserves gradient because darker = more blend)
+    result = img.astype(np.float32)
+    blend = shadow_amount[:, :, np.newaxis]
+    clean_bg = np.full_like(result, clean_wall)
+    result = result * (1 - blend) + clean_bg * blend
 
-    # Preserve contact shadows: near the subject's feet, blend some of the
-    # original floor darkness to simulate natural shadow
-    # Find the bottom of the subject
-    subject_rows = np.where(np.any(subject_mask > 128, axis=1))[0]
-    if len(subject_rows) > 0:
-        subject_bottom = subject_rows[-1]
-        shadow_zone_h = int(h * 0.08)  # shadow zone below subject
-
-        for y in range(max(0, subject_bottom - 10), min(h, subject_bottom + shadow_zone_h)):
-            if y < subject_bottom:
-                shadow_strength = 0.3
-            else:
-                dist_from_bottom = (y - subject_bottom) / max(shadow_zone_h, 1)
-                shadow_strength = max(0, 0.4 * (1 - dist_from_bottom ** 0.5))
-
-            # Only apply shadow where original was darker than backdrop
-            orig_row = gray[y, :]
-            backdrop_brightness = np.mean(backdrop[y, :], axis=1) if backdrop.ndim == 3 else backdrop[y, :]
-            backdrop_row_bright = np.mean(backdrop[y, :].reshape(-1, 3), axis=1)
-            shadow_mask_row = (orig_row < backdrop_row_bright * 0.9) & (subject_f[y, :] < 0.5)
-            shadow_mask_f = shadow_mask_row.astype(np.float32) * shadow_strength
-            shadow_mask_f = cv2.GaussianBlur(shadow_mask_f.reshape(1, -1), (51, 1), 0).flatten()
-            s3 = shadow_mask_f[:, np.newaxis]
-            result[y] = result[y] * (1 - s3) + img[y].astype(np.float32) * s3
+    # Subject composite: wide feather for clean edges, no proximity tricks
+    subj_f = (subject_mask > 128).astype(np.float32)
+    # Wide feather so the transition from original subject to lifted background is smooth
+    feather = max(int(min(h, w) * 0.015), 11)
+    feather = feather + (1 - feather % 2)
+    subj_f = cv2.GaussianBlur(subj_f, (feather, feather), 0)[:, :, np.newaxis]
+    result = subj_f * img.astype(np.float32) + (1 - subj_f) * result
 
     return np.clip(result, 0, 255).astype(np.uint8)
+
+
+# ── Technique 3: Floor replacement ──
+def replace_floor(img, bg_mask, subject_mask, floor_mask, floor_start, darken=0.8):
+    """Replace the floor area with a gradient from wall color."""
+    h, w = img.shape[:2]
+    if np.sum(floor_mask) == 0:
+        return img
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    # Sample wall color from clean area just above floor
+    wall_zone = bg_mask.copy()
+    wall_zone[floor_mask > 0] = 0
+    wall_zone[:max(0, floor_start - int(h * 0.15)), :] = 0  # just above the floor
+    wall_pixels = img[wall_zone > 0]
+    if len(wall_pixels) < 50:
+        wall_zone = bg_mask.copy()
+        wall_zone[floor_mask > 0] = 0
+        wall_pixels = img[wall_zone > 0]
+    if len(wall_pixels) < 50:
+        return img
+
+    brightness = np.mean(wall_pixels, axis=1)
+    clean_wall = np.median(wall_pixels[brightness > np.percentile(brightness, 60)], axis=0).astype(np.float32)
+
+    # Build gradient for floor area
+    result = img.astype(np.float32).copy()
+    floor_h = h - floor_start
+    if floor_h <= 0:
+        return img
+
+    for y in range(floor_start, h):
+        t = (y - floor_start) / max(floor_h, 1)
+        # Smooth gradient: starts at wall color, darkens toward bottom
+        color = clean_wall * (1.0 - (1.0 - darken) * (t ** 0.6))
+        # Only replace floor background pixels
+        floor_row = (floor_mask[y, :] > 0) & (subject_mask[y, :] < 128)
+        result[y, floor_row] = color
+
+    # Also fill the baseboard/bar zone (dark area right at transition)
+    bar_zone = max(0, floor_start - int(h * 0.02))
+    for y in range(bar_zone, min(floor_start + int(h * 0.02), h)):
+        t = max(0, (y - floor_start)) / max(floor_h, 1)
+        color = clean_wall * (1.0 - (1.0 - darken) * max(0, t ** 0.6))
+        dark_here = (gray[y, :] < np.mean(clean_wall) * 0.6)
+        replace_px = dark_here & (bg_mask[y, :] > 0) & (subject_mask[y, :] < 128)
+        result[y, replace_px] = color
+
+    # Feather the transition
+    result_u8 = np.clip(result, 0, 255).astype(np.uint8)
+    blended = cv2.GaussianBlur(result_u8, (1, 31), 0)
+
+    # Only apply blur at the transition zone
+    trans_mask = np.zeros((h, w), dtype=np.float32)
+    trans_top = max(0, floor_start - 15)
+    trans_bot = min(h, floor_start + 15)
+    for y in range(trans_top, trans_bot):
+        trans_mask[y, :] = 1.0 - abs(y - floor_start) / 15.0
+    trans_mask = np.clip(trans_mask, 0, 1)
+    trans_3 = trans_mask[:, :, np.newaxis]
+    result_u8 = (trans_3 * blended.astype(np.float32) +
+                  (1 - trans_3) * result_u8.astype(np.float32))
+
+    # Protect subject
+    subj_f = (subject_mask > 128).astype(np.float32)
+    subj_f = cv2.GaussianBlur(subj_f, (3, 3), 0)[:, :, np.newaxis]
+    final = subj_f * img.astype(np.float32) + (1 - subj_f) * result_u8
+    return np.clip(final, 0, 255).astype(np.uint8)
 
 
 HTML = """
@@ -340,35 +335,36 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .header { padding: 12px 20px; background: #222; border-bottom: 1px solid #333; display: flex; align-items: center; gap: 20px; }
 .header h1 { font-size: 18px; font-weight: 600; }
 .main { display: flex; height: calc(100vh - 49px); }
-.sidebar { width: 320px; background: #222; padding: 16px; overflow-y: auto; border-right: 1px solid #333; flex-shrink: 0; }
+.sidebar { width: 340px; background: #222; padding: 16px; overflow-y: auto; border-right: 1px solid #333; flex-shrink: 0; }
 .viewer { flex: 1; display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; }
 .viewer img { max-width: 100%; max-height: 100%; object-fit: contain; }
-.section { margin-bottom: 20px; }
-.section h3 { font-size: 13px; text-transform: uppercase; color: #888; margin-bottom: 10px; letter-spacing: 0.5px; }
-.control { margin-bottom: 14px; }
-.control label { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px; }
-.control label span { color: #aaa; }
-.control input[type=range] { width: 100%; accent-color: #4a9eff; }
-.control input[type=checkbox] { accent-color: #4a9eff; }
-.checkbox-row { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-bottom: 8px; }
-.btn { padding: 10px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; width: 100%; margin-bottom: 8px; }
-.btn-primary { background: #4a9eff; color: white; }
-.btn-primary:hover { background: #3a8eef; }
-.btn-secondary { background: #333; color: #ccc; }
-.btn-secondary:hover { background: #444; }
-.btn:disabled { opacity: 0.5; cursor: not-allowed; }
-.status { font-size: 12px; color: #888; padding: 8px 0; }
-.view-toggle { display: flex; gap: 4px; margin-bottom: 12px; }
-.view-btn { flex: 1; padding: 6px; border: 1px solid #444; background: #2a2a2a; color: #aaa; border-radius: 4px; cursor: pointer; font-size: 12px; text-align: center; }
-.view-btn.active { background: #4a9eff; color: white; border-color: #4a9eff; }
-.drop-zone { border: 2px dashed #444; border-radius: 8px; padding: 40px; text-align: center; cursor: pointer; transition: border-color 0.2s; }
+.section { margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid #333; }
+.section:last-child { border-bottom: none; }
+.section h3 { font-size: 11px; text-transform: uppercase; color: #666; margin-bottom: 8px; letter-spacing: 1px; }
+.control { margin-bottom: 10px; }
+.control label { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 2px; }
+.control label span { color: #888; }
+input[type=range] { width: 100%; accent-color: #4a9eff; }
+input[type=checkbox] { accent-color: #4a9eff; }
+.check-row { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-bottom: 6px; }
+.btn { padding: 8px 12px; border: none; border-radius: 5px; cursor: pointer; font-size: 12px; font-weight: 500; width: 100%; margin-bottom: 6px; }
+.btn-blue { background: #4a9eff; color: white; }
+.btn-blue:hover { background: #3a8eef; }
+.btn-grey { background: #333; color: #bbb; }
+.btn-grey:hover { background: #444; }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.status { font-size: 11px; color: #777; padding: 4px 0; }
+.tabs { display: flex; gap: 3px; margin-bottom: 8px; }
+.tab { flex: 1; padding: 5px; border: 1px solid #444; background: #2a2a2a; color: #888; border-radius: 3px; cursor: pointer; font-size: 11px; text-align: center; }
+.tab.on { background: #4a9eff; color: white; border-color: #4a9eff; }
+.drop-zone { border: 2px dashed #444; border-radius: 8px; padding: 30px; text-align: center; cursor: pointer; }
 .drop-zone:hover, .drop-zone.dragover { border-color: #4a9eff; }
-.drop-zone p { color: #888; font-size: 14px; }
-.file-input { display: none; }
-.slider-value { min-width: 28px; text-align: right; }
-#loading { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 100; align-items: center; justify-content: center; }
-#loading.active { display: flex; }
-#loading .spinner { font-size: 18px; color: white; }
+.drop-zone p { color: #666; font-size: 13px; }
+input[type=text] { width:100%; padding:6px 8px; background:#2a2a2a; border:1px solid #444; border-radius:4px; color:#e0e0e0; font-size:11px; }
+#loading { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:100; align-items:center; justify-content:center; }
+#loading.on { display:flex; }
+.technique-box { background: #2a2a2a; border-radius: 6px; padding: 10px; margin-bottom: 8px; }
+.technique-box h4 { font-size: 12px; margin-bottom: 6px; color: #ccc; }
 </style>
 </head>
 <body>
@@ -380,293 +376,138 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     <div class="sidebar">
         <div class="section">
             <h3>Image</h3>
-            <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
-                <p>Drop image here or click to browse</p>
-                <p style="font-size:11px;margin-top:8px;color:#666">Or paste a file path below</p>
+            <div class="drop-zone" id="dropZone" onclick="document.getElementById('fi').click()">
+                <p>Drop image or click to browse</p>
             </div>
-            <input type="file" class="file-input" id="fileInput" accept="image/*">
-            <input type="text" id="pathInput" placeholder="/path/to/image.jpg"
-                   style="width:100%;padding:8px;margin-top:8px;background:#2a2a2a;border:1px solid #444;border-radius:4px;color:#e0e0e0;font-size:12px;">
-            <button class="btn btn-secondary" onclick="loadFromPath()" style="margin-top:4px">Load from path</button>
+            <input type="file" id="fi" accept="image/*" style="display:none">
+            <input type="text" id="pathInput" placeholder="Paste file path..." style="margin-top:6px">
+            <button class="btn btn-grey" onclick="loadPath()" style="margin-top:4px">Load path</button>
         </div>
 
         <div class="section">
             <h3>View</h3>
-            <div class="view-toggle">
-                <div class="view-btn active" data-view="original" onclick="setView('original')">Original</div>
-                <div class="view-btn" data-view="mask" onclick="setView('mask')">Mask</div>
-                <div class="view-btn" data-view="result" onclick="setView('result')">Result</div>
+            <div class="tabs">
+                <div class="tab on" data-v="original" onclick="view('original')">Original</div>
+                <div class="tab" data-v="preview" onclick="view('preview')">Preview</div>
+                <div class="tab" data-v="marks" onclick="view('marks')">Marks</div>
+                <div class="tab" data-v="shadows" onclick="view('shadows')">Shadows</div>
             </div>
         </div>
 
         <div class="section">
-            <h3>Detection</h3>
+            <h3>1. Marks &amp; Blemishes (LaMa)</h3>
+            <div class="check-row"><input type="checkbox" id="doMarks" checked><label for="doMarks">Enable</label></div>
             <div class="control">
-                <label>Wrinkle sensitivity <span class="slider-value" id="sensVal">15</span></label>
-                <input type="range" id="sensitivity" min="5" max="40" value="15" oninput="updateVal('sensVal', this.value)">
+                <label>Sensitivity <span id="sensV">10</span></label>
+                <input type="range" id="sens" min="3" max="30" value="10" oninput="document.getElementById('sensV').textContent=this.value">
             </div>
-            <div class="control">
-                <label>Shadow strength <span class="slider-value" id="shadowVal">20</span></label>
-                <input type="range" id="shadow" min="10" max="50" value="20" oninput="updateVal('shadowVal', this.value)">
-            </div>
-            <div class="control">
-                <label>Scuff sensitivity <span class="slider-value" id="scuffVal">12</span></label>
-                <input type="range" id="scuff" min="5" max="30" value="12" oninput="updateVal('scuffVal', this.value)">
-            </div>
-            <div class="checkbox-row">
-                <input type="checkbox" id="darkBars" checked>
-                <label for="darkBars">Detect dark bars/edges</label>
-            </div>
-            <div class="checkbox-row">
-                <input type="checkbox" id="edgeDetect" checked>
-                <label for="edgeDetect">Detect seam lines</label>
-            </div>
-            <div class="checkbox-row">
-                <input type="checkbox" id="includeFloor">
-                <label for="includeFloor">Include floor (seamless backdrop)</label>
-            </div>
-            <button class="btn btn-secondary" onclick="detectOnly()">Update Detection Preview</button>
         </div>
 
         <div class="section">
-            <h3>Mode</h3>
-            <div class="view-toggle">
-                <div class="view-btn active" data-mode="retouch" onclick="setMode('retouch')">Retouch</div>
-                <div class="view-btn" data-mode="replace" onclick="setMode('replace')">Replace Backdrop</div>
-            </div>
-            <div id="replaceOpts" style="display:none;margin-top:8px;">
-                <div class="control">
-                    <label>Floor darken <span class="slider-value" id="floorDarkenVal">75</span>%</label>
-                    <input type="range" id="floorDarken" min="40" max="100" value="75" oninput="updateVal('floorDarkenVal', this.value)">
-                </div>
+            <h3>2. Shadow Lift</h3>
+            <div class="check-row"><input type="checkbox" id="doShadow" checked><label for="doShadow">Enable</label></div>
+            <div class="control">
+                <label>Lift strength <span id="liftV">70</span>%</label>
+                <input type="range" id="lift" min="0" max="100" value="70" oninput="document.getElementById('liftV').textContent=this.value">
             </div>
         </div>
+
+        <!-- Floor replacement removed - keeping original floor -->
+
 
         <div class="section">
             <h3>Process</h3>
-            <button class="btn btn-primary" id="processBtn" onclick="process()" disabled>Run</button>
-            <button class="btn btn-secondary" id="saveBtn" onclick="saveResult()" disabled>Save Full Resolution</button>
+            <button class="btn btn-blue" id="prevBtn" onclick="doPreview()" disabled>Preview All</button>
+            <button class="btn btn-blue" id="runBtn" onclick="doProcess()" disabled>Apply (Full Res)</button>
+            <button class="btn btn-grey" id="saveBtn" onclick="doSave()" disabled>Save</button>
             <div class="status" id="status"></div>
         </div>
     </div>
-    <div class="viewer" id="viewerArea">
-        <img id="preview" src="" style="display:none">
-        <div id="placeholder" style="color:#555;font-size:14px;">Drop an image anywhere or paste a path</div>
+    <div class="viewer" id="viewer">
+        <img id="img" src="" style="display:none">
+        <div id="ph" style="color:#555;font-size:14px;">Drop an image anywhere</div>
     </div>
 </div>
-
-<div id="loading"><div class="spinner">Processing...</div></div>
+<div id="loading"><div style="color:white;font-size:16px;" id="loadMsg">Processing...</div></div>
 
 <script>
-let currentView = 'original';
-let currentMode = 'retouch';
-let images = { original: null, mask: null, result: null };
+let imgs = {};
+let curView = 'original';
 
-function setMode(mode) {
-    currentMode = mode;
-    document.querySelectorAll('[data-mode]').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
-    document.getElementById('replaceOpts').style.display = mode === 'replace' ? 'block' : 'none';
+function view(v) {
+    curView = v;
+    document.querySelectorAll('[data-v]').forEach(t => t.classList.toggle('on', t.dataset.v === v));
+    if (imgs[v]) { document.getElementById('img').src = 'data:image/jpeg;base64,' + imgs[v]; document.getElementById('img').style.display='block'; document.getElementById('ph').style.display='none'; }
 }
 
-function updateVal(id, val) { document.getElementById(id).textContent = val; }
+function loading(msg) { document.getElementById('loadMsg').textContent=msg||'Processing...'; document.getElementById('loading').classList.add('on'); }
+function loaded() { document.getElementById('loading').classList.remove('on'); }
+function status(s) { document.getElementById('status').textContent=s; }
 
-function setView(view) {
-    currentView = view;
-    document.querySelectorAll('.view-btn').forEach(b => b.classList.toggle('active', b.dataset.view === view));
-    if (images[view]) {
-        document.getElementById('preview').src = 'data:image/jpeg;base64,' + images[view];
-        document.getElementById('preview').style.display = 'block';
-        document.getElementById('placeholder').style.display = 'none';
-    }
+function params() { return {
+    do_marks: document.getElementById('doMarks').checked,
+    sensitivity: +document.getElementById('sens').value,
+    do_shadow: document.getElementById('doShadow').checked,
+    lift: +document.getElementById('lift').value / 100,
+};}
+
+// Drop handling
+function handleDrop(file) {
+    loading('Finding ' + file.name + '...');
+    fetch('/find_load', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({filename:file.name}) })
+    .then(r=>r.json()).then(d => { loaded(); if(d.error){alert(d.error);return;}
+        imgs = {original: d.image}; document.getElementById('imageInfo').textContent=d.info;
+        document.getElementById('pathInput').value=d.path||'';
+        document.getElementById('prevBtn').disabled=false; document.getElementById('runBtn').disabled=false;
+        view('original');
+    }).catch(e=>{loaded();alert(e);});
 }
 
-function showLoading(msg) {
-    document.querySelector('#loading .spinner').textContent = msg || 'Processing...';
-    document.getElementById('loading').classList.add('active');
-}
-function hideLoading() { document.getElementById('loading').classList.remove('active'); }
-
-function setStatus(msg) { document.getElementById('status').textContent = msg; }
-
-// File upload
-document.getElementById('fileInput').addEventListener('change', function(e) {
-    if (e.target.files.length > 0) {
-        const file = e.target.files[0];
-        showLoading('Finding ' + file.name + ' on disk...');
-        fetch('/find_and_load', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({filename: file.name})
-        })
-        .then(r => r.json())
-        .then(data => {
-            hideLoading();
-            if (data.error) { alert(data.error); return; }
-            images.original = data.image;
-            images.mask = null;
-            images.result = null;
-            document.getElementById('imageInfo').textContent = data.info;
-            document.getElementById('pathInput').value = data.original_path || '';
-            document.getElementById('processBtn').disabled = false;
-            setView('original');
-        })
-        .catch(err => { hideLoading(); alert('Error: ' + err); });
-    }
+const dz = document.getElementById('dropZone');
+const vw = document.getElementById('viewer');
+[dz, vw].forEach(el => {
+    el.addEventListener('dragover', e=>{e.preventDefault();dz.classList.add('dragover');});
+    el.addEventListener('dragleave', ()=>dz.classList.remove('dragover'));
+    el.addEventListener('drop', e=>{e.preventDefault();dz.classList.remove('dragover');if(e.dataTransfer.files.length)handleDrop(e.dataTransfer.files[0]);});
 });
+document.getElementById('fi').addEventListener('change', e=>{if(e.target.files.length)handleDrop(e.target.files[0]);});
 
-const dropZone = document.getElementById('dropZone');
-const viewerArea = document.getElementById('viewerArea');
-dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
-dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
-
-// Also allow dropping on the viewer area
-viewerArea.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
-viewerArea.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
-viewerArea.addEventListener('drop', e => {
-    e.preventDefault();
-    dropZone.classList.remove('dragover');
-    if (e.dataTransfer.files.length > 0) {
-        handleFileDrop(e.dataTransfer.files[0]);
-    }
-});
-dropZone.addEventListener('drop', e => {
-    e.preventDefault();
-    dropZone.classList.remove('dragover');
-    if (e.dataTransfer.files.length > 0) handleFileDrop(e.dataTransfer.files[0]);
-});
-
-function handleFileDrop(file) {
-    showLoading('Finding ' + file.name + ' on disk...');
-    fetch('/find_and_load', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({filename: file.name})
-    })
-    .then(r => r.json())
-    .then(data => {
-        hideLoading();
-        if (data.error) { alert(data.error); return; }
-        images.original = data.image;
-        images.mask = null;
-        images.result = null;
-        document.getElementById('imageInfo').textContent = data.info;
-        document.getElementById('pathInput').value = data.original_path || '';
-        document.getElementById('processBtn').disabled = false;
-        setView('original');
-    })
-    .catch(err => { hideLoading(); alert('Error: ' + err); });
+function loadPath() {
+    let p = document.getElementById('pathInput').value.trim().replace(/"/g,'');
+    if(!p) return;
+    loading('Loading...');
+    fetch('/load_path', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:p})})
+    .then(r=>r.json()).then(d=>{loaded();if(d.error){alert(d.error);return;}
+        imgs={original:d.image}; document.getElementById('imageInfo').textContent=d.info;
+        document.getElementById('pathInput').value=d.path||p;
+        document.getElementById('prevBtn').disabled=false; document.getElementById('runBtn').disabled=false;
+        view('original');
+    }).catch(e=>{loaded();alert(e);});
 }
 
-function uploadFile(file) {
-    showLoading('Uploading and segmenting subject...');
-    const formData = new FormData();
-    formData.append('file', file);
-    fetch('/upload', { method: 'POST', body: formData })
-        .then(r => r.json())
-        .then(data => {
-            hideLoading();
-            if (data.error) { alert(data.error); return; }
-            images.original = data.image;
-            images.mask = null;
-            images.result = null;
-            document.getElementById('imageInfo').textContent = data.info;
-            document.getElementById('processBtn').disabled = false;
-            setView('original');
-        })
-        .catch(err => { hideLoading(); alert('Error: ' + err); });
+function doPreview() {
+    loading('Building preview...');
+    fetch('/preview', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(params())})
+    .then(r=>r.json()).then(d=>{loaded();if(d.error){alert(d.error);return;}
+        imgs.preview=d.preview; imgs.marks=d.marks; imgs.shadows=d.shadows;
+        status(d.info); view('preview');
+    }).catch(e=>{loaded();alert(e);});
 }
 
-function loadFromPath() {
-    const path = document.getElementById('pathInput').value.trim();
-    if (!path) return;
-    showLoading('Loading and segmenting subject...');
-    fetch('/load_path', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({path: path})
-    })
-    .then(r => r.json())
-    .then(data => {
-        hideLoading();
-        if (data.error) { alert(data.error); return; }
-        images.original = data.image;
-        images.mask = null;
-        images.result = null;
-        document.getElementById('imageInfo').textContent = data.info;
-        document.getElementById('processBtn').disabled = false;
-        setView('original');
-    })
-    .catch(err => { hideLoading(); alert('Error: ' + err); });
+function doProcess() {
+    loading('Applying full resolution (may take a minute)...');
+    fetch('/process', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(params())})
+    .then(r=>r.json()).then(d=>{loaded();if(d.error){alert(d.error);return;}
+        imgs.preview=d.preview; document.getElementById('saveBtn').disabled=false;
+        status(d.info); view('preview');
+    }).catch(e=>{loaded();alert(e);});
 }
 
-function detectOnly() {
-    showLoading('Detecting blemishes...');
-    const params = getParams();
-    fetch('/detect', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(params)
-    })
-    .then(r => r.json())
-    .then(data => {
-        hideLoading();
-        if (data.error) { alert(data.error); return; }
-        images.mask = data.mask_overlay;
-        setStatus(data.info);
-        setView('mask');
-    })
-    .catch(err => { hideLoading(); alert('Error: ' + err); });
-}
-
-function process() {
-    showLoading('Running LaMa inpainting (may take a minute)...');
-    const params = getParams();
-    fetch('/process', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(params)
-    })
-    .then(r => r.json())
-    .then(data => {
-        hideLoading();
-        if (data.error) { alert(data.error); return; }
-        images.result = data.result;
-        images.mask = data.mask_overlay;
-        document.getElementById('saveBtn').disabled = false;
-        setStatus(data.info);
-        setView('result');
-    })
-    .catch(err => { hideLoading(); alert('Error: ' + err); });
-}
-
-function saveResult() {
-    showLoading('Saving full resolution...');
-    const params = getParams();
-    fetch('/save', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(params)
-    })
-    .then(r => r.json())
-    .then(data => {
-        hideLoading();
-        if (data.error) { alert(data.error); return; }
-        setStatus('Saved: ' + data.path);
-    })
-    .catch(err => { hideLoading(); alert('Error: ' + err); });
-}
-
-function getParams() {
-    return {
-        mode: currentMode,
-        sensitivity: parseInt(document.getElementById('sensitivity').value),
-        shadow: parseInt(document.getElementById('shadow').value),
-        scuff: parseInt(document.getElementById('scuff').value),
-        dark_bars: document.getElementById('darkBars').checked,
-        edges: document.getElementById('edgeDetect').checked,
-        include_floor: document.getElementById('includeFloor').checked,
-        floor_darken: parseInt(document.getElementById('floorDarken').value) / 100,
-    };
+function doSave() {
+    loading('Saving...');
+    fetch('/save', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})})
+    .then(r=>r.json()).then(d=>{loaded();if(d.error){alert(d.error);return;} status('Saved: '+d.path);})
+    .catch(e=>{loaded();alert(e);});
 }
 </script>
 </body>
@@ -679,321 +520,212 @@ def index():
     return render_template_string(HTML)
 
 
-def find_file_on_disk(filename):
-    """Search common photo directories for the original file by name."""
-    search_roots = [
-        "/mnt/c/Users",
-        "/mnt/d/Photos",
-        "/mnt/d",
-        "/mnt/e",
-    ]
-    import subprocess
-    for root in search_roots:
-        if not os.path.isdir(root):
-            continue
-        try:
-            result = subprocess.run(
-                ["find", root, "-name", filename, "-type", "f", "-maxdepth", "8"],
-                capture_output=True, text=True, timeout=10
-            )
-            matches = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
-            if matches:
-                return matches[0]  # Return first match
-        except:
-            continue
-    return None
-
-
-@app.route('/find_and_load', methods=['POST'])
-def find_and_load():
-    data = request.json
-    filename = data.get('filename', '')
-    if not filename:
-        return jsonify({"error": "No filename provided"})
-
-    path = find_file_on_disk(filename)
+@app.route('/find_load', methods=['POST'])
+def find_load():
+    fn = request.json.get('filename', '')
+    if not fn:
+        return jsonify({"error": "No filename"})
+    path = find_file(fn)
     if not path:
-        return jsonify({"error": f"Could not find '{filename}' on disk. Try pasting the full path instead."})
-
-    result = _load_image(path)
-    resp = result.get_json()
-    resp['original_path'] = path
-    return jsonify(resp)
+        return jsonify({"error": f"'{fn}' not found on disk. Paste the full path."})
+    return _load(path)
 
 
 @app.route('/load_path', methods=['POST'])
 def load_path():
-    data = request.json
-    path = data.get('path', '').strip().strip('"')
-
-    # Convert Windows paths to WSL
-    import re
-    if re.match(r'^[A-Za-z]:\\', path):
-        drive = path[0].lower()
-        path = '/mnt/' + drive + path[2:].replace('\\', '/')
-
+    path = request.json.get('path', '').strip().strip('"')
+    m = re.match(r'^([A-Za-z]):\\', path)
+    if m:
+        path = '/mnt/' + m.group(1).lower() + path[2:].replace('\\', '/')
     if not os.path.exists(path):
-        return jsonify({"error": f"File not found: {path}"})
-
-    result = _load_image(path)
-    data = result.get_json()
-    data['original_path'] = path
-    return jsonify(data)
+        return jsonify({"error": f"Not found: {path}"})
+    return _load(path)
 
 
-def _load_image(path):
+def _load(path):
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is None:
-        return jsonify({"error": "Could not read image"})
-
+        return jsonify({"error": "Can't read image"})
     if len(img.shape) == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     elif img.shape[2] == 4:
         img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
     h, w = img.shape[:2]
-
-    # Store ICC profile
     try:
-        pil_img = Image.open(path)
-        state["icc_profile"] = pil_img.info.get('icc_profile')
+        pil = Image.open(path)
+        state["icc_profile"] = pil.info.get('icc_profile')
     except:
         state["icc_profile"] = None
 
     state["img"] = img
     state["img_path"] = path
 
-    # Segment subject
+    # Segment
     pil_img = Image.open(path).convert("RGB")
     session = new_session("u2net_human_seg")
-    subject_mask = np.array(remove(pil_img, session=session, only_mask=True))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    subject_mask = cv2.morphologyEx(subject_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
-    subject_mask = cv2.morphologyEx(subject_mask, cv2.MORPH_OPEN,
-                                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
-    state["subject_mask"] = subject_mask
+    sm = np.array(remove(pil_img, session=session, only_mask=True))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    sm = cv2.morphologyEx(sm, cv2.MORPH_CLOSE, k, iterations=3)
+    sm = cv2.morphologyEx(sm, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
+    state["subject_mask"] = sm
 
-    protect_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    protected = cv2.dilate(subject_mask, protect_kernel, iterations=2)
+    pk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    protected = cv2.dilate(sm, pk, iterations=2)
     state["bg_mask"] = (protected < 128).astype(np.uint8)
-    state["floor_mask"] = detect_floor_boundary(img, state["bg_mask"])
 
-    # Preview
-    preview, _ = resize_for_preview(img, state["preview_size"])
-    b64 = img_to_b64(preview)
+    fm, fs = detect_floor(img, state["bg_mask"])
+    state["floor_mask"] = fm
+    state["floor_start_row"] = fs
 
-    floor_info = "floor detected" if np.sum(state["floor_mask"]) > 0 else "single surface"
-    return jsonify({
-        "image": b64,
-        "info": f"{w}x{h} | {floor_info}"
-    })
+    preview = preview_resize(img)
+    floor_info = f"floor at row {fs}" if np.sum(fm) > 0 else "no floor boundary"
+    return jsonify({"image": to_b64(preview), "info": f"{w}x{h} | {floor_info}", "path": path})
 
 
-@app.route('/detect', methods=['POST'])
-def detect():
+@app.route('/preview', methods=['POST'])
+def preview():
     if state["img"] is None:
         return jsonify({"error": "No image loaded"})
 
-    params = request.json
-    floor = state["floor_mask"] if not params.get("include_floor", False) else np.zeros_like(state["floor_mask"])
-    mask = detect_blemishes(
-        state["img"], state["bg_mask"], floor,
-        sensitivity=params.get("sensitivity", 15),
-        shadow_strength=params.get("shadow", 20),
-        scuff_strength=params.get("scuff", 12),
-        detect_dark_bars=params.get("dark_bars", True),
-        detect_edges=params.get("edges", True),
-    )
-    mask[state["subject_mask"] > 128] = 0  # protect subject
+    p = request.json
+    img = state["img"]
+    h, w = img.shape[:2]
+    current = img.copy()
+    info_parts = []
 
-    h, w = state["img"].shape[:2]
-    coverage = np.sum(mask > 0) / (h * w) * 100
+    # Technique 2: Shadow lift (do before marks so LaMa sees lifted image)
+    shadow_vis = None
+    if p.get("do_shadow"):
+        current = compute_shadow_lift(current, state["bg_mask"], state["floor_mask"],
+                                       state["subject_mask"], strength=p.get("lift", 0.7))
+        # Visualization: diff between original and lifted
+        diff = np.abs(current.astype(np.float32) - img.astype(np.float32))
+        diff_vis = img.copy()
+        changed = np.mean(diff, axis=2) > 5
+        diff_vis[changed] = [0, 165, 255]
+        shadow_vis = preview_resize(cv2.addWeighted(img, 0.5, diff_vis, 0.5, 0))
+        info_parts.append("shadows lifted")
 
-    # Create overlay visualization
-    overlay = state["img"].copy()
-    overlay[mask > 128] = [0, 165, 255]  # orange
-    blended = cv2.addWeighted(state["img"], 0.5, overlay, 0.5, 0)
+    # Technique 1: Marks detection (show mask, don't inpaint yet for preview speed)
+    marks_vis = None
+    if p.get("do_marks"):
+        marks_mask = detect_marks(current, state["bg_mask"], state["floor_mask"],
+                                   sensitivity=p.get("sensitivity", 15))
+        marks_mask[state["subject_mask"] > 128] = 0
+        cov = np.sum(marks_mask > 0) / (h * w) * 100
+        overlay = current.copy()
+        overlay[marks_mask > 128] = [0, 165, 255]
+        marks_vis = preview_resize(cv2.addWeighted(current, 0.5, overlay, 0.5, 0))
+        info_parts.append(f"marks: {cov:.1f}%")
 
-    preview, _ = resize_for_preview(blended, state["preview_size"])
+    # Final subject composite
+    sf = state["subject_mask"].astype(np.float32) / 255.0
+    sf = cv2.GaussianBlur(sf, (3, 3), 0)[:, :, np.newaxis]
+    final = (sf * img.astype(np.float32) + (1 - sf) * current.astype(np.float32))
+    final = np.clip(final, 0, 255).astype(np.uint8)
+
     return jsonify({
-        "mask_overlay": img_to_b64(preview),
-        "info": f"Detected {coverage:.1f}% blemishes"
+        "preview": to_b64(preview_resize(final)),
+        "marks": to_b64(marks_vis) if marks_vis is not None else to_b64(preview_resize(img)),
+        "shadows": to_b64(shadow_vis) if shadow_vis is not None else to_b64(preview_resize(img)),
+        "info": " | ".join(info_parts) if info_parts else "No techniques enabled",
     })
 
 
 @app.route('/process', methods=['POST'])
-def process():
+def process_full():
     if state["img"] is None:
         return jsonify({"error": "No image loaded"})
 
-    params = request.json
+    p = request.json
     img = state["img"]
     h, w = img.shape[:2]
-
-    # Replace mode: synthetic seamless backdrop
-    if params.get("mode") == "replace":
-        final = generate_seamless_backdrop(
-            img, state["bg_mask"], state["subject_mask"], state["floor_mask"],
-            floor_darken=params.get("floor_darken", 0.75),
-        )
-        state["last_result"] = final
-        result_preview, _ = resize_for_preview(final, state["preview_size"])
-        return jsonify({
-            "result": img_to_b64(result_preview),
-            "mask_overlay": img_to_b64(result_preview),
-            "info": "Backdrop replaced with synthetic seamless"
-        })
-
-    # Detect
-    mask = detect_blemishes(
-        img, state["bg_mask"], state["floor_mask"],
-        sensitivity=params.get("sensitivity", 15),
-        shadow_strength=params.get("shadow", 20),
-        scuff_strength=params.get("scuff", 12),
-        detect_dark_bars=params.get("dark_bars", True),
-        detect_edges=params.get("edges", True),
-    )
-    mask[state["subject_mask"] > 128] = 0
-    coverage = np.sum(mask > 0) / (h * w) * 100
-
-    if coverage < 0.1:
-        return jsonify({"error": "No blemishes detected with current settings"})
-
-    # Iterative LaMa inpainting:
-    # Large masks smudge at low res, so we do multiple passes:
-    # Pass 1: small blemishes (dilated less) at higher res
-    # Pass 2: remaining larger areas
-    model, device = get_lama_model()
     current = img.copy()
+    info_parts = []
 
-    # Work at as high a resolution as VRAM allows
-    max_dim = 3072  # higher res = cleaner result
-    scale = min(max_dim / max(h, w), 1.0)
+    # Technique 2: Shadow lift (same as preview)
+    if p.get("do_shadow"):
+        current = compute_shadow_lift(current, state["bg_mask"], state["floor_mask"],
+                                       state["subject_mask"], strength=p.get("lift", 0.7))
+        info_parts.append("shadows lifted")
 
-    # If mask coverage is very high (>25%), do two passes
-    if coverage > 25:
-        # Pass 1: just wrinkles and small marks (erode mask to shrink to cores)
-        small_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-        small_mask = cv2.erode(mask, small_kernel, iterations=2)
-        small_mask = cv2.dilate(small_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1)
-
-        if np.sum(small_mask > 0) > 0:
-            if scale < 1.0:
-                sh, sw = int(h * scale), int(w * scale)
-                r1 = inpaint_lama(cv2.resize(current, (sw, sh), interpolation=cv2.INTER_AREA),
-                                   cv2.resize(small_mask, (sw, sh), interpolation=cv2.INTER_NEAREST),
-                                   model, device)
-                r1 = cv2.resize(r1, (w, h), interpolation=cv2.INTER_LANCZOS4)
-            else:
-                r1 = inpaint_lama(current, small_mask, model, device)
-            m1 = (small_mask > 128).astype(np.float32)
-            m1 = cv2.GaussianBlur(m1, (7, 7), 0)[:, :, np.newaxis]
-            current = (m1 * r1.astype(np.float32) + (1 - m1) * current.astype(np.float32))
-            current = np.clip(current, 0, 255).astype(np.uint8)
-
-        # Pass 2: remaining areas (shadows, bars) on the now-cleaner image
-        remaining = mask.copy()
-        remaining[small_mask > 128] = 0
-        if np.sum(remaining > 0) > 0:
-            if scale < 1.0:
-                sh, sw = int(h * scale), int(w * scale)
-                r2 = inpaint_lama(cv2.resize(current, (sw, sh), interpolation=cv2.INTER_AREA),
-                                   cv2.resize(remaining, (sw, sh), interpolation=cv2.INTER_NEAREST),
-                                   model, device)
-                r2 = cv2.resize(r2, (w, h), interpolation=cv2.INTER_LANCZOS4)
-            else:
-                r2 = inpaint_lama(current, remaining, model, device)
-            m2 = (remaining > 128).astype(np.float32)
-            m2 = cv2.GaussianBlur(m2, (7, 7), 0)[:, :, np.newaxis]
-            current = (m2 * r2.astype(np.float32) + (1 - m2) * current.astype(np.float32))
-            current = np.clip(current, 0, 255).astype(np.uint8)
-    else:
-        # Single pass for small coverage
-        if scale < 1.0:
-            sh, sw = int(h * scale), int(w * scale)
-            lama_result = inpaint_lama(cv2.resize(current, (sw, sh), interpolation=cv2.INTER_AREA),
-                                        cv2.resize(mask, (sw, sh), interpolation=cv2.INTER_NEAREST),
-                                        model, device)
-            lama_result = cv2.resize(lama_result, (w, h), interpolation=cv2.INTER_LANCZOS4)
-        else:
-            lama_result = inpaint_lama(current, mask, model, device)
-        mask_f = (mask > 128).astype(np.float32)
-        mask_f = cv2.GaussianBlur(mask_f, (7, 7), 0)[:, :, np.newaxis]
-        current = (mask_f * lama_result.astype(np.float32) +
-                   (1 - mask_f) * current.astype(np.float32))
-        current = np.clip(current, 0, 255).astype(np.uint8)
-
-    # Light polish
-    smoothed = current.copy()
-    for _ in range(2):
-        smoothed = cv2.bilateralFilter(smoothed, 9, 25, 25)
-    bg_f = state["bg_mask"].astype(np.float32)
-    if np.sum(state["floor_mask"]) > 0:
-        bg_f[state["floor_mask"] > 0] = 0
-    bg_f = cv2.GaussianBlur(bg_f, (11, 11), 0)[:, :, np.newaxis]
-    current = (bg_f * smoothed.astype(np.float32) + (1 - bg_f) * current.astype(np.float32))
-    current = np.clip(current, 0, 255).astype(np.uint8)
-
-    # Final composite
-    subj_f = state["subject_mask"].astype(np.float32) / 255.0
-    subj_f = cv2.GaussianBlur(subj_f, (3, 3), 0)[:, :, np.newaxis]
-    final = (subj_f * img.astype(np.float32) + (1 - subj_f) * current.astype(np.float32))
+    # Subject composite (sharp - minimal feather)
+    sf = state["subject_mask"].astype(np.float32) / 255.0
+    sf = cv2.GaussianBlur(sf, (3, 3), 0)[:, :, np.newaxis]
+    final = (sf * img.astype(np.float32) + (1 - sf) * current.astype(np.float32))
     final = np.clip(final, 0, 255).astype(np.uint8)
 
+    # Technique 1: LaMa on marks ONLY if enabled - very conservative
+    if p.get("do_marks"):
+        marks_mask = detect_marks(final, state["bg_mask"], state["floor_mask"],
+                                   sensitivity=p.get("sensitivity", 10))
+        marks_mask[state["subject_mask"] > 128] = 0
+        cov = np.sum(marks_mask > 0) / (h * w) * 100
+
+        # Hard cap at 5% - LaMa should only touch tiny isolated marks
+        if cov > 5:
+            marks_mask = detect_marks(final, state["bg_mask"], state["floor_mask"],
+                                       sensitivity=max(p.get("sensitivity", 10) * 3, 25))
+            marks_mask[state["subject_mask"] > 128] = 0
+            cov = np.sum(marks_mask > 0) / (h * w) * 100
+
+        if cov > 0.1 and cov <= 5:
+            print(f"  LaMa on {cov:.1f}% marks")
+            model, device = get_lama()
+            max_dim = 3072
+            scale = min(max_dim / max(h, w), 1.0)
+            if scale < 1.0:
+                sh, sw = int(h * scale), int(w * scale)
+                lr = run_lama(cv2.resize(final, (sw, sh), interpolation=cv2.INTER_AREA),
+                              cv2.resize(marks_mask, (sw, sh), interpolation=cv2.INTER_NEAREST), model, device)
+                lr = cv2.resize(lr, (w, h), interpolation=cv2.INTER_LANCZOS4)
+            else:
+                lr = run_lama(final, marks_mask, model, device)
+            mf = (marks_mask > 128).astype(np.float32)
+            mf = cv2.GaussianBlur(mf, (3, 3), 0)[:, :, np.newaxis]
+            final = (mf * lr.astype(np.float32) + (1 - mf) * final.astype(np.float32))
+            final = np.clip(final, 0, 255).astype(np.uint8)
+            info_parts.append(f"marks healed ({cov:.1f}%)")
+        else:
+            info_parts.append(f"marks skipped ({cov:.1f}% - {'too many' if cov > 5 else 'none found'})")
+
     state["last_result"] = final
-
-    # Preview images
-    result_preview, _ = resize_for_preview(final, state["preview_size"])
-    overlay = img.copy()
-    overlay[mask > 128] = [0, 165, 255]
-    blended = cv2.addWeighted(img, 0.5, overlay, 0.5, 0)
-    mask_preview, _ = resize_for_preview(blended, state["preview_size"])
-
     return jsonify({
-        "result": img_to_b64(result_preview),
-        "mask_overlay": img_to_b64(mask_preview),
-        "info": f"Healed {coverage:.1f}% blemishes"
+        "preview": to_b64(preview_resize(final)),
+        "info": " | ".join(info_parts) if info_parts else "Processed",
     })
 
 
 @app.route('/save', methods=['POST'])
 def save():
     if state.get("last_result") is None:
-        return jsonify({"error": "No result to save. Run processing first."})
+        return jsonify({"error": "Run process first"})
+    path = state["img_path"]
+    base, ext = os.path.splitext(path)
+    out = f"{base}_clean{ext}"
 
-    # Determine output path
-    input_path = state["img_path"]
-    base, ext = os.path.splitext(input_path)
-    output_path = f"{base}_clean{ext}"
-
-    final = state["last_result"]
-    final_rgb = cv2.cvtColor(final, cv2.COLOR_BGR2RGB)
-    pil = Image.fromarray(final_rgb)
-
-    save_kwargs = {}
+    rgb = cv2.cvtColor(state["last_result"], cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(rgb)
+    kw = {}
     if state["icc_profile"]:
-        save_kwargs["icc_profile"] = state["icc_profile"]
-
+        kw["icc_profile"] = state["icc_profile"]
     try:
-        original_pil = Image.open(input_path)
-        exif = original_pil.info.get("exif")
+        orig = Image.open(path)
+        exif = orig.info.get("exif")
         if exif:
-            save_kwargs["exif"] = exif
+            kw["exif"] = exif
     except:
         pass
 
-    ext_out = ext.lower()
-    if ext_out in ('.tif', '.tiff'):
-        pil.save(output_path, **save_kwargs)
-    elif ext_out == '.png':
-        pil.save(output_path, **save_kwargs)
+    if ext.lower() in ('.tif', '.tiff'):
+        pil.save(out, **kw)
     else:
-        pil.save(output_path, quality=98, subsampling=0, **save_kwargs)
-
-    return jsonify({"path": output_path})
+        pil.save(out, quality=98, subsampling=0, **kw)
+    return jsonify({"path": out})
 
 
 if __name__ == '__main__':
-    print("\n  Clean Backdrop Web UI")
-    print("  Open http://localhost:5000 in your browser\n")
+    print("\n  Clean Backdrop v2")
+    print("  http://localhost:5000\n")
     app.run(host='0.0.0.0', port=5000, debug=False)
