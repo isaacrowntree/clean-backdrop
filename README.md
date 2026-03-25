@@ -1,82 +1,63 @@
 # Clean Backdrop
 
-Free, open-source tool to clean up studio photo backdrops. Removes wrinkles, seams, uneven lighting, and other imperfections while preserving the subject and natural contact shadows.
+Free, open-source tool to clean up studio photo backdrops. Uses a three-technique approach to remove blemishes, lift shadows, and clean walls while preserving the subject perfectly.
 
 An alternative to paid tools like Retouch4me Clean Backdrop.
 
-![Before and After](docs/example_preview.jpg)
+## How It Works
 
-## Features
+Three independent techniques, each tunable:
 
-- **Automatic subject segmentation** using [rembg](https://github.com/danielgatis/rembg) (U2Net)
-- **Auto-detects backdrop color** or lets you specify a target color
-- **Preserves contact shadows** so the subject doesn't look like they're floating
-- **Feathered edges** for natural blending between subject and background
-- Supports JPEG, TIFF (16-bit), and PNG output
-- Side-by-side preview mode
+1. **Shadow Lift** - Blends cast shadows toward the clean wall color. No pixel replacement, just brightness/color correction. Preserves natural wall gradient.
+2. **Marks & Blemishes** (LaMa) - AI inpainting on small isolated marks only (wrinkles, scuffs, seams, dust). Capped at 5% of image to prevent smudging.
+3. **Subject Protection** - rembg segmentation ensures the subject is never touched. Sharp edges, no ghosting.
 
-## Installation
+Works with both seamless paper backdrops and wall+floor setups. Automatically detects different floor surfaces and excludes them.
+
+## Web UI
+
+Local web interface with sliders, live preview, and before/after comparison.
 
 ```bash
 pip install -r requirements.txt
+python app_v2.py
+# Open http://localhost:5000
 ```
 
-## Usage
+- Drop images from your file explorer or paste a file path
+- Adjust shadow lift strength and mark sensitivity
+- Preview shows shadow lift instantly (no AI processing)
+- Apply runs LaMa on detected marks at full resolution
+- Save outputs next to the original with `_clean` suffix
+- ICC color profiles and EXIF metadata preserved
+
+## CLI Usage
 
 ```bash
-# Basic usage (auto-detects backdrop color)
-python clean_backdrop.py photo.jpg
+# Basic usage
+python clean_backdrop.py input.jpg
 
-# Specify output path
-python clean_backdrop.py photo.jpg cleaned.jpg
+# With options
+python clean_backdrop.py input.jpg --sensitivity 10 --preview
 
-# Specify a target backdrop color
-python clean_backdrop.py photo.jpg --color "#FFFFFF"
-
-# Generate a side-by-side comparison
-python clean_backdrop.py photo.jpg --preview
-
-# Adjust edge feathering (default: 15)
-python clean_backdrop.py photo.jpg --feather 20
-
-# Use TIFF for maximum quality
-python clean_backdrop.py photo.tiff cleaned.tiff --color "#E8E4E0"
+# With Stable Diffusion for removing large foreign objects
+python clean_backdrop.py input.jpg --sd --preview
 ```
 
 ## Recommended Workflow
 
-1. Develop your RAW files in Lightroom / Capture One (color correction, exposure, white balance)
-2. Export as **high-quality JPEG** or **16-bit TIFF**
-3. Run `clean_backdrop.py` on the exported files
-4. Use the cleaned files as your final output or continue retouching
+1. Develop your RAW files in Lightroom / Capture One
+2. Export as high-quality JPEG or 16-bit TIFF
+3. Drop into the web UI, tune shadow lift and mark sensitivity
+4. Preview, then Apply and Save
 
 TIFF is preferred over JPEG for this step because smooth backdrop gradients can show banding artifacts in 8-bit JPEG.
 
-## Options
+## Requirements
 
-| Flag | Description | Default |
-|---|---|---|
-| `input` | Input image path | (required) |
-| `output` | Output image path | `input_clean.ext` |
-| `--color` | Target backdrop color as hex (e.g. `#FFFFFF`) | Auto-detected |
-| `--feather` | Edge feather amount in pixels | `15` |
-| `--preview` | Save a side-by-side before/after comparison | Off |
-
-## How It Works
-
-1. **Segmentation** - Uses U2Net (human segmentation model) via rembg to separate subject from background
-2. **Mask refinement** - Morphological operations clean up the segmentation edges
-3. **Color detection** - Samples the brightest background pixels to determine the intended backdrop color
-4. **Shadow preservation** - Detects contact shadows near the subject's feet and preserves them with a natural falloff
-5. **Compositing** - Blends the subject over a clean, uniform background using the feathered mask
-6. **Final smoothing** - Bilateral filter on background areas removes any remaining texture
-
-## Limitations
-
-- Works best with studio photos on solid-color backdrops (white, gray, etc.)
-- Subject segmentation quality depends on the rembg model - complex poses or loose clothing may need manual touchup
-- Does not handle colored/textured backdrops (muslin, painted, etc.)
-- First run downloads the U2Net model (~176MB)
+- Python 3.10+
+- NVIDIA GPU recommended (CUDA) - works on CPU but slower
+- ~200MB for LaMa model (downloaded on first run)
 
 ## License
 

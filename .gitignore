@@ -16,6 +16,13 @@ venv/
 test_*.jpg
 test_*.tiff
 test_*.png
+both_*.jpg
+lama_*.jpg
+v3_*.jpg
+v3b_*.jpg
+silvana_*.jpg
+*_clean.jpg
+*_clean_preview.jpg
 
 # OS
 .DS_Store
