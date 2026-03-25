@@ -174,16 +174,13 @@ def freq_separation(img, bg_mask, floor_mask, subject_mask, strength=0.7):
     # Weighted blur: only average from background pixels so subject doesn't bleed in
     img_f = img.astype(np.float32)
     wm = work.astype(np.float32)
-    wm3 = wm[:, :, np.newaxis]
-
-    weighted = img_f * wm3
-    weight = wm3.copy()
 
     ksize = int(sigma * 6) | 1  # 6*sigma, make odd
+    weighted = img_f * wm[:, :, np.newaxis]
     low_freq = cv2.GaussianBlur(weighted, (ksize, ksize), sigma)
-    low_weight = cv2.GaussianBlur(weight, (ksize, ksize), sigma)
+    low_weight = cv2.GaussianBlur(wm, (ksize, ksize), sigma)
     low_weight = np.maximum(low_weight, 1e-6)
-    low_freq = low_freq / low_weight
+    low_freq = low_freq / low_weight[:, :, np.newaxis]
 
     # High-freq = original - low_freq (the texture/marks/detail)
     # Removing high-freq = just using low_freq on the background
@@ -191,7 +188,7 @@ def freq_separation(img, bg_mask, floor_mask, subject_mask, strength=0.7):
     # Blend: strength controls how much texture is removed
     # 0 = original, 1 = fully smoothed (low_freq only)
     result = img_f.copy()
-    blend = (wm * strength)[:, :, np.newaxis]
+    blend = (work.astype(np.float32) * strength)[:, :, np.newaxis]
     result = result * (1 - blend) + low_freq * blend
 
     # Subject composite - tight edge
