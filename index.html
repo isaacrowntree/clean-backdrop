@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Clean Backdrop - Free AI Studio Background Retouching</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #1a1a2e; background: #fff; line-height: 1.6; }
+
+.hero {
+    background: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 100%);
+    color: white;
+    padding: 80px 20px 60px;
+    text-align: center;
+}
+.hero h1 { font-size: 48px; font-weight: 700; margin-bottom: 16px; }
+.hero p { font-size: 20px; color: #a0a0b8; max-width: 640px; margin: 0 auto 32px; }
+.hero .badges { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-bottom: 40px; }
+.badge { padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 500; }
+.badge-blue { background: rgba(74, 158, 255, 0.15); color: #6bb3ff; border: 1px solid rgba(74, 158, 255, 0.3); }
+.badge-green { background: rgba(74, 222, 128, 0.15); color: #6be68a; border: 1px solid rgba(74, 222, 128, 0.3); }
+.badge-purple { background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); }
+
+.cta-buttons { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+.btn { padding: 12px 28px; border-radius: 8px; text-decoration: none; font-size: 15px; font-weight: 600; transition: transform 0.15s, box-shadow 0.15s; display: inline-block; }
+.btn:hover { transform: translateY(-1px); }
+.btn-primary { background: #4a9eff; color: white; box-shadow: 0 4px 14px rgba(74, 158, 255, 0.4); }
+.btn-secondary { background: rgba(255,255,255,0.1); color: #ccc; border: 1px solid rgba(255,255,255,0.2); }
+
+.container { max-width: 1100px; margin: 0 auto; padding: 0 20px; }
+
+.comparison {
+    padding: 60px 20px;
+    background: #f8f9fa;
+}
+.comparison h2 { text-align: center; font-size: 32px; margin-bottom: 8px; }
+.comparison .sub { text-align: center; color: #666; margin-bottom: 40px; font-size: 16px; }
+.comparison-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    max-width: 1000px;
+    margin: 0 auto;
+}
+.comparison-grid img {
+    width: 100%;
+    border-radius: 8px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+}
+.comparison-grid .label {
+    text-align: center;
+    font-size: 14px;
+    color: #888;
+    margin-top: 8px;
+    font-weight: 500;
+}
+
+.web-ui-section {
+    padding: 60px 20px;
+}
+.web-ui-section h2 { text-align: center; font-size: 32px; margin-bottom: 8px; }
+.web-ui-section .sub { text-align: center; color: #666; margin-bottom: 40px; font-size: 16px; }
+.web-ui-screenshot {
+    max-width: 1000px;
+    margin: 0 auto;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.15);
+}
+.web-ui-screenshot img { width: 100%; display: block; }
+
+.techniques {
+    padding: 60px 20px;
+    background: #f8f9fa;
+}
+.techniques h2 { text-align: center; font-size: 32px; margin-bottom: 40px; }
+.tech-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px; max-width: 1000px; margin: 0 auto; }
+.tech-card {
+    background: white;
+    border-radius: 12px;
+    padding: 32px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+}
+.tech-card .num { font-size: 13px; font-weight: 700; color: #4a9eff; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+.tech-card h3 { font-size: 20px; margin-bottom: 12px; }
+.tech-card p { color: #555; font-size: 14px; line-height: 1.7; }
+
+.install {
+    padding: 60px 20px;
+}
+.install h2 { text-align: center; font-size: 32px; margin-bottom: 32px; }
+.install-steps { max-width: 700px; margin: 0 auto; }
+.install-step {
+    background: #1a1a2e;
+    color: #e0e0e0;
+    border-radius: 8px;
+    padding: 20px 24px;
+    margin-bottom: 12px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 14px;
+    position: relative;
+    overflow-x: auto;
+}
+.install-step .comment { color: #666; }
+.install-step .cmd { color: #6be68a; }
+
+footer {
+    text-align: center;
+    padding: 40px 20px;
+    color: #999;
+    font-size: 13px;
+    border-top: 1px solid #eee;
+}
+footer a { color: #4a9eff; text-decoration: none; }
+
+@media (max-width: 700px) {
+    .hero h1 { font-size: 32px; }
+    .comparison-grid { grid-template-columns: 1fr; }
+    .tech-grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<div class="hero">
+    <h1>Clean Backdrop</h1>
+    <p>Free, open-source AI tool to clean studio photo backdrops. Remove shadows, marks, and blemishes while preserving the subject perfectly.</p>
+    <div class="badges">
+        <span class="badge badge-blue">Shadow Lift</span>
+        <span class="badge badge-green">LaMa Inpainting</span>
+        <span class="badge badge-purple">GPU Accelerated</span>
+    </div>
+    <div class="cta-buttons">
+        <a href="https://github.com/isaacrowntree/clean-backdrop" class="btn btn-primary">View on GitHub</a>
+        <a href="https://github.com/isaacrowntree/clean-backdrop/archive/refs/heads/main.zip" class="btn btn-secondary">Download ZIP</a>
+    </div>
+</div>
+
+<div class="comparison">
+    <div class="container">
+        <h2>Before & After</h2>
+        <p class="sub">Cast shadows lifted, wall marks cleaned. Subject untouched.</p>
+        <div class="comparison-grid">
+            <div>
+                <img src="before.jpg" alt="Before - original studio photo with shadows and marks">
+                <div class="label">Before</div>
+            </div>
+            <div>
+                <img src="after.jpg" alt="After - clean backdrop with shadows removed">
+                <div class="label">After</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="web-ui-section">
+    <div class="container">
+        <h2>Local Web UI</h2>
+        <p class="sub">Tune sliders, preview instantly, apply at full resolution. Runs entirely on your machine.</p>
+        <div class="web-ui-screenshot">
+            <img src="web-ui.png" alt="Clean Backdrop web interface with sliders and live preview">
+        </div>
+    </div>
+</div>
+
+<div class="techniques">
+    <div class="container">
+        <h2>How It Works</h2>
+        <div class="tech-grid">
+            <div class="tech-card">
+                <div class="num">Technique 1</div>
+                <h3>Shadow Lift</h3>
+                <p>Blends cast shadows toward the sampled clean wall color. No AI pixel replacement &mdash; just smart color correction that preserves the natural wall gradient. Adjustable strength from 0&ndash;100%.</p>
+            </div>
+            <div class="tech-card">
+                <div class="num">Technique 2</div>
+                <h3>Marks & Blemishes</h3>
+                <p>LaMa AI inpainting targets only small isolated marks &mdash; wrinkles, scuffs, seams, dust. Capped at 5% of the image to prevent smudging. Your 4070 Ti processes it in seconds.</p>
+            </div>
+            <div class="tech-card">
+                <div class="num">Technique 3</div>
+                <h3>Subject Protection</h3>
+                <p>rembg segmentation ensures the subject is never modified. Sharp edges with minimal feathering &mdash; no ghosting, no color bleed. ICC profiles and EXIF metadata preserved.</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="install">
+    <div class="container">
+        <h2>Get Started</h2>
+        <div class="install-steps">
+            <div class="install-step">
+                <span class="comment"># Clone the repo</span><br>
+                <span class="cmd">git clone https://github.com/isaacrowntree/clean-backdrop.git</span><br>
+                <span class="cmd">cd clean-backdrop</span>
+            </div>
+            <div class="install-step">
+                <span class="comment"># Install dependencies</span><br>
+                <span class="cmd">pip install -r requirements.txt</span>
+            </div>
+            <div class="install-step">
+                <span class="comment"># Launch the web UI</span><br>
+                <span class="cmd">python app_v2.py</span><br>
+                <span class="comment"># Open http://localhost:5000</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<footer>
+    <p>MIT License &middot; Built by <a href="https://github.com/isaacrowntree">Isaac Rowntree</a> &middot; <a href="https://github.com/isaacrowntree/clean-backdrop">Source on GitHub</a></p>
+</footer>
+
+</body>
+</html>
