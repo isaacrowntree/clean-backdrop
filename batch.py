@@ -35,7 +35,7 @@ def to_wsl_path(path):
     return path
 
 
-def process_image(fpath, out_path, session, lift_strength=0.7, tex_strength=0.5):
+def process_image(fpath, out_path, session, lift_strength=0.7, tex_strength=0.5, no_floor=False):
     img = cv2.imread(fpath)
     if img is None:
         return False, "can't read"
@@ -57,7 +57,10 @@ def process_image(fpath, out_path, session, lift_strength=0.7, tex_strength=0.5)
     pk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     protected = cv2.dilate(sm, pk, iterations=2)
     bg_mask = (protected < 128).astype(np.uint8)
-    fm, fs = detect_floor(img, bg_mask)
+    if no_floor:
+        fm = np.zeros((h, w), dtype=np.uint8)
+    else:
+        fm, fs = detect_floor(img, bg_mask)
 
     current = img.copy()
 
@@ -97,6 +100,7 @@ def main():
     parser.add_argument("--lift", type=int, default=70, help="Shadow lift 0-100 (default: 70)")
     parser.add_argument("--texture", type=int, default=50, help="Texture smoothing 0-100 (default: 50)")
     parser.add_argument("--ext", default="jpg", help="File extension (default: jpg)")
+    parser.add_argument("--no-floor", action="store_true", help="Disable floor detection (treat everything as wall)")
 
     args = parser.parse_args()
 
@@ -137,7 +141,8 @@ def main():
         try:
             success, info = process_image(fpath, out_path, session,
                                            lift_strength=args.lift / 100,
-                                           tex_strength=args.texture / 100)
+                                           tex_strength=args.texture / 100,
+                                           no_floor=args.no_floor)
             if success:
                 print(f"-> {info}")
                 ok += 1

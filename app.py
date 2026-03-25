@@ -84,7 +84,9 @@ def detect_floor(img, bg_mask):
     floor_color = np.median(img[ft:][fs], axis=0)
 
     diff = np.sqrt(np.sum((wall_color.astype(float) - floor_color.astype(float)) ** 2))
-    if diff < 60:
+    # Needs to be a VERY clear color difference to count as a different floor
+    # Gradient darkening on the same wall is typically 30-80, real floor change is 100+
+    if diff < 100:
         return floor_mask, floor_start
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -105,6 +107,15 @@ def detect_floor(img, bg_mask):
                 floor_mask[floor_start:, :] = bg_mask[floor_start:, :]
 
     return floor_mask, floor_start
+
+
+def _smooth_bg_mask(subject_mask, h, w):
+    """Smooth float mask: 0 at subject, ramping to 1 in deep background.
+    Eliminates hard-edge 'bar' artifacts at the subject boundary."""
+    subj = (subject_mask > 128).astype(np.uint8)
+    dist = cv2.distanceTransform(1 - subj, cv2.DIST_L2, 5)
+    feather_px = max(int(min(h, w) * 0.02), 15)
+    return np.clip(dist / feather_px, 0, 1).astype(np.float32)
 
 
 # ── Technique 1: Shadow lift ──
@@ -139,16 +150,15 @@ def shadow_lift(img, bg_mask, floor_mask, subject_mask, strength=0.7):
     blur_size = blur_size + (1 - blur_size % 2)
     shadow_amount = cv2.GaussianBlur(shadow_amount, (blur_size, blur_size), 0)
 
+    # Smooth ramp near subject replaces hard subject composite
+    smooth = _smooth_bg_mask(subject_mask, h, w)
+    shadow_amount = shadow_amount * smooth
+
     # Blend toward clean wall
     result = img.astype(np.float32)
     blend = shadow_amount[:, :, np.newaxis]
     clean_bg = np.full_like(result, clean_wall)
     result = result * (1 - blend) + clean_bg * blend
-
-    # Subject composite - tight edge
-    subj_f = (subject_mask > 128).astype(np.float32)
-    subj_f = cv2.GaussianBlur(subj_f, (3, 3), 0)[:, :, np.newaxis]
-    result = subj_f * img.astype(np.float32) + (1 - subj_f) * result
 
     return np.clip(result, 0, 255).astype(np.uint8)
 
@@ -156,13 +166,14 @@ def shadow_lift(img, bg_mask, floor_mask, subject_mask, strength=0.7):
 # ── Technique 2: Frequency separation ──
 def freq_separation(img, bg_mask, floor_mask, subject_mask, strength=0.7):
     """
-    Remove high-frequency detail (marks, scuffs, wrinkles, texture) from the wall
-    while keeping the low-frequency lighting gradient intact.
+    Remove high-frequency detail (marks, scuffs, wrinkles, texture) from the
+    entire background while keeping the low-frequency lighting gradient intact.
+    Works on wall AND floor - the gradient/transition between them is preserved.
     strength: 0 = no smoothing, 1 = full texture removal
     """
     h, w = img.shape[:2]
     work = bg_mask.copy()
-    work[floor_mask > 0] = 0
+    work[floor_mask > 0] = 0  # exclude floor - it has intentional texture
 
     if np.sum(work) < 100:
         return img.copy()
@@ -186,15 +197,12 @@ def freq_separation(img, bg_mask, floor_mask, subject_mask, strength=0.7):
     # Removing high-freq = just using low_freq on the background
 
     # Blend: strength controls how much texture is removed
-    # 0 = original, 1 = fully smoothed (low_freq only)
+    # Smooth ramp near subject replaces hard subject composite
+    smooth = _smooth_bg_mask(subject_mask, h, w)
+    smooth[floor_mask > 0] = 0  # exclude floor same as work mask
     result = img_f.copy()
-    blend = (work.astype(np.float32) * strength)[:, :, np.newaxis]
+    blend = (smooth * strength)[:, :, np.newaxis]
     result = result * (1 - blend) + low_freq * blend
-
-    # Subject composite - tight edge
-    subj_f = (subject_mask > 128).astype(np.float32)
-    subj_f = cv2.GaussianBlur(subj_f, (3, 3), 0)[:, :, np.newaxis]
-    result = subj_f * img_f + (1 - subj_f) * result
 
     return np.clip(result, 0, 255).astype(np.uint8)
 
@@ -285,6 +293,7 @@ input[type=text] { width:100%; padding:6px 8px; background:#2a2a2a; border:1px s
                 <input type="range" id="tex" min="0" max="100" value="50"
                     oninput="document.getElementById('texV').textContent=this.value">
             </div>
+            <div class="check-row"><input type="checkbox" id="excludeFloor" checked><label for="excludeFloor">Exclude floor</label></div>
         </div>
 
         <div class="section">
@@ -324,6 +333,7 @@ function params() { return {
     lift: +document.getElementById('lift').value / 100,
     do_texture: document.getElementById('doTexture').checked,
     tex_strength: +document.getElementById('tex').value / 100,
+    exclude_floor: document.getElementById('excludeFloor').checked,
 };}
 
 function handleDrop(file) {
