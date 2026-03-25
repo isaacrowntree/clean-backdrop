@@ -152,7 +152,7 @@ def detect_watermark_regions(img):
 def segment_subject(input_path):
     """Segment subject with rembg + protect watermarks."""
     pil_img = Image.open(input_path).convert("RGB")
-    session = new_session("u2net_human_seg")
+    session = new_session("birefnet-portrait")
     mask = np.array(remove(pil_img, session=session, only_mask=True))
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))

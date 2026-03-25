@@ -1,6 +1,6 @@
 # Clean Backdrop
 
-Free, open-source tool to clean up studio photo backdrops. Uses a three-technique approach to remove blemishes, lift shadows, and clean walls while preserving the subject perfectly.
+Free, open-source tool to clean up studio photo backdrops. Uses shadow lifting and frequency separation to remove shadows, marks, and blemishes while preserving the subject perfectly. No AI inpainting artifacts - just clean math on your GPU.
 
 An alternative to paid tools like Retouch4me Clean Backdrop.
 
@@ -12,17 +12,17 @@ An alternative to paid tools like Retouch4me Clean Backdrop.
 
 ## How It Works
 
-Three independent techniques, each tunable:
+Two complementary techniques:
 
-1. **Shadow Lift** - Blends cast shadows toward the clean wall color. No pixel replacement, just brightness/color correction. Preserves natural wall gradient.
-2. **Marks & Blemishes** (LaMa) - AI inpainting on small isolated marks only (wrinkles, scuffs, seams, dust). Capped at 5% of image to prevent smudging.
-3. **Subject Protection** - rembg segmentation ensures the subject is never touched. Sharp edges, no ghosting.
+1. **Shadow Lift** - Blends cast shadows toward the sampled clean wall color. Removes shadows while preserving the natural wall gradient. Adjustable strength 0-100%.
 
-Works with both seamless paper backdrops and wall+floor setups. Automatically detects different floor surfaces and excludes them.
+2. **Texture Smoothing** (Frequency Separation) - Separates the image into low-frequency (lighting gradient) and high-frequency (texture/marks/scuffs). Smooths the texture while keeping the gradient intact. No false positives, no smudging.
+
+Both techniques use **birefnet-portrait** for subject segmentation (state-of-the-art edge quality) and run on GPU via CUDA.
 
 ## Web UI
 
-Local web interface with sliders, live preview, and before/after comparison.
+Local web interface with sliders and instant preview.
 
 ```bash
 pip install -r requirements.txt
@@ -30,40 +30,41 @@ python app.py
 # Open http://localhost:5000
 ```
 
-- Drop images from your file explorer or paste a file path
-- Adjust shadow lift strength and mark sensitivity
-- Preview shows shadow lift instantly (no AI processing)
-- Apply runs LaMa on detected marks at full resolution
+- Drop images from Explorer or paste a file path
+- Adjust shadow lift and texture smoothing independently
+- View tabs: Original | Shadows | Texture | Preview
+- Auto-processes on image load
 - Save outputs next to the original with `_clean` suffix
 - ICC color profiles and EXIF metadata preserved
 
-## CLI Usage
+## Batch Processing
 
 ```bash
-# Basic usage
-python clean_backdrop.py input.jpg
+# Shadow lift + texture smoothing
+python batch.py "D:\Photos\Export\My Shoot" --lift 70 --texture 50
 
-# With options
-python clean_backdrop.py input.jpg --sensitivity 10 --preview
+# Shadow lift only
+python batch.py /path/to/folder --lift 80 --texture 0
 
-# With Stable Diffusion for removing large foreign objects
-python clean_backdrop.py input.jpg --sd --preview
+# Custom output folder
+python batch.py "D:\Photos\shoot" --output retouched --lift 100 --texture 60
 ```
-
-## Recommended Workflow
-
-1. Develop your RAW files in Lightroom / Capture One
-2. Export as high-quality JPEG or 16-bit TIFF
-3. Drop into the web UI, tune shadow lift and mark sensitivity
-4. Preview, then Apply and Save
-
-TIFF is preferred over JPEG for this step because smooth backdrop gradients can show banding artifacts in 8-bit JPEG.
 
 ## Requirements
 
 - Python 3.10+
-- NVIDIA GPU recommended (CUDA) - works on CPU but slower
-- ~200MB for LaMa model (downloaded on first run)
+- NVIDIA GPU (CUDA) - used for segmentation and processing
+- `onnxruntime-gpu` for GPU-accelerated subject segmentation
+- ~928MB for birefnet-portrait model (downloaded on first run)
+
+## Installation
+
+```bash
+git clone https://github.com/isaacrowntree/clean-backdrop.git
+cd clean-backdrop
+pip install -r requirements.txt
+pip install onnxruntime-gpu  # for GPU segmentation
+```
 
 ## License
 

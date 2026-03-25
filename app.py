@@ -1,30 +1,21 @@
 #!/usr/bin/env python3
 """
-Clean Backdrop v2 - Three-technique approach:
-1. LaMa: small blemishes only (marks, wrinkles, scuffs)
-2. Shadow lift: brighten cast shadows to match surrounding wall
-3. Floor replace: synthetic gradient from wall color
-
-Each has independent controls. Preview shows all three layered.
+Clean Backdrop - Studio background retouching tool.
+1. Shadow lift: blends cast shadows toward clean wall color
+2. Frequency separation: smooths texture/marks while keeping lighting gradient
+Both run on GPU. No AI inpainting needed.
 """
 
 import os
 import io
 import base64
-import json
 import re
 import subprocess
-import tempfile
 import numpy as np
 import cv2
 from PIL import Image
 from flask import Flask, render_template_string, request, jsonify
 from rembg import remove, new_session
-import torch
-
-LAMA_MODEL_URL = "https://huggingface.co/fashn-ai/LaMa/resolve/main/big-lama.pt"
-LAMA_MODEL_DIR = os.path.expanduser("~/.cache/clean-backdrop")
-LAMA_MODEL_PATH = os.path.join(LAMA_MODEL_DIR, "big-lama.pt")
 
 app = Flask(__name__)
 
@@ -35,59 +26,10 @@ state = {
     "bg_mask": None,
     "floor_mask": None,
     "floor_start_row": None,
-    "lama_model": None,
-    "device": None,
     "preview_size": 1200,
     "icc_profile": None,
     "last_result": None,
 }
-
-
-def download_lama():
-    if os.path.exists(LAMA_MODEL_PATH):
-        return
-    os.makedirs(LAMA_MODEL_DIR, exist_ok=True)
-    import urllib.request
-    urllib.request.urlretrieve(LAMA_MODEL_URL, LAMA_MODEL_PATH)
-
-
-def get_lama():
-    if state["lama_model"] is None:
-        download_lama()
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        state["device"] = device
-        state["lama_model"] = torch.jit.load(LAMA_MODEL_PATH, map_location=device)
-        state["lama_model"].eval()
-    return state["lama_model"], state["device"]
-
-
-def pad8(img):
-    h, w = img.shape[:2]
-    ph = (8 - h % 8) % 8
-    pw = (8 - w % 8) % 8
-    if ph == 0 and pw == 0:
-        return img, (0, 0)
-    if img.ndim == 3:
-        return np.pad(img, ((0, ph), (0, pw), (0, 0)), mode='reflect'), (ph, pw)
-    return np.pad(img, ((0, ph), (0, pw)), mode='reflect'), (ph, pw)
-
-
-def run_lama(image, mask, model, device):
-    h, w = image.shape[:2]
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    mf = (mask > 128).astype(np.float32)
-    rgb, (ph, pw) = pad8(rgb)
-    mf, _ = pad8(mf)
-    with torch.no_grad():
-        out = model(
-            torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(device),
-            torch.from_numpy(mf).unsqueeze(0).unsqueeze(0).to(device),
-        )
-    out = out[0].permute(1, 2, 0).cpu().numpy()
-    out = np.clip(out * 255, 0, 255).astype(np.uint8)
-    if ph > 0: out = out[:-ph]
-    if pw > 0: out = out[:, :-pw]
-    return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
 
 
 def preview_resize(img):
@@ -165,46 +107,9 @@ def detect_floor(img, bg_mask):
     return floor_mask, floor_start
 
 
-# ── Technique 1: Detect small blemishes for LaMa ──
-def detect_marks(img, bg_mask, floor_mask, sensitivity=15):
-    """Only wrinkles, scuffs, marks - NOT shadows, NOT floor."""
-    h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    work = bg_mask.copy()
-    work[floor_mask > 0] = 0
-
-    # High-freq wrinkles
-    lo = cv2.GaussianBlur(gray, (0, 0), sigmaX=8)
-    hi = np.abs(gray - lo)
-    marks = ((hi > sensitivity) & (work > 0)).astype(np.uint8)
-
-    # Scuffs (local dark spots)
-    local = cv2.GaussianBlur(gray, (0, 0), sigmaX=15)
-    scuffs = ((local - gray > sensitivity * 0.8) & (work > 0)).astype(np.uint8)
-    bright = ((gray - local > sensitivity * 0.8) & (work > 0)).astype(np.uint8)
-
-    # Seam lines
-    edges = cv2.Canny(gray.astype(np.uint8), 15, 50)
-    seams = ((edges > 0) & (work > 0)).astype(np.uint8)
-    sobelx = np.abs(cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3))
-    vseams = ((sobelx > 15) & (work > 0)).astype(np.uint8)
-
-    combined = np.clip(marks + scuffs + bright + seams + vseams, 0, 1).astype(np.uint8)
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    combined = cv2.dilate(combined, k, iterations=1)
-    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE,
-                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1)
-    combined[floor_mask > 0] = 0
-    return combined * 255
-
-
-# ── Technique 2: Shadow lift ──
-def compute_shadow_lift(img, bg_mask, floor_mask, subject_mask, strength=0.7):
-    """
-    Lift shadows by blending toward clean wall color.
-    Compares every wall pixel directly to the clean wall brightness -
-    NOT to a blur that includes the shadow.
-    """
+# ── Technique 1: Shadow lift ──
+def shadow_lift(img, bg_mask, floor_mask, subject_mask, strength=0.7):
+    """Blend shadows toward clean wall color. Preserves gradient shape."""
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
     work = bg_mask.copy()
@@ -213,115 +118,88 @@ def compute_shadow_lift(img, bg_mask, floor_mask, subject_mask, strength=0.7):
     if np.sum(work) < 100:
         return img.copy()
 
-    # Find the clean wall color from the brightest background pixels
+    # Clean wall color from brightest bg pixels
     wall_pixels = img[work > 0]
     brightness = np.mean(wall_pixels, axis=1)
     bright_pixels = wall_pixels[brightness > np.percentile(brightness, 80)]
     if len(bright_pixels) < 10:
         return img.copy()
-    clean_wall = np.median(bright_pixels, axis=0).astype(np.float32)  # BGR
+    clean_wall = np.median(bright_pixels, axis=0).astype(np.float32)
     clean_brightness = np.mean(clean_wall)
 
-    # Shadow amount: how much darker is each pixel compared to clean wall
-    # This is a direct comparison, not relative to a blur
+    # Shadow amount: how much darker vs clean wall
     darkness = clean_brightness - gray
-    max_shadow_depth = clean_brightness * 0.5  # shadows up to 50% darker than clean wall
-    shadow_amount = np.clip(darkness / max(max_shadow_depth, 1), 0, 1)
-    shadow_amount = shadow_amount * strength
+    max_depth = clean_brightness * 0.5
+    shadow_amount = np.clip(darkness / max(max_depth, 1), 0, 1) * strength
 
-    # Shadow amount applies everywhere on the wall - let the gradient do the work
-    # Darker pixels naturally get lifted more, lighter ones less = gradient preserved
     shadow_amount[work == 0] = 0
 
-    # Very wide smooth to include the full shadow with soft edges
+    # Wide blur for smooth transition
     blur_size = max(int(min(h, w) * 0.06), 51)
     blur_size = blur_size + (1 - blur_size % 2)
     shadow_amount = cv2.GaussianBlur(shadow_amount, (blur_size, blur_size), 0)
 
-    # Blend toward clean wall color (preserves gradient because darker = more blend)
+    # Blend toward clean wall
     result = img.astype(np.float32)
     blend = shadow_amount[:, :, np.newaxis]
     clean_bg = np.full_like(result, clean_wall)
     result = result * (1 - blend) + clean_bg * blend
 
-    # Subject composite: wide feather for clean edges, no proximity tricks
+    # Subject composite - tight edge
     subj_f = (subject_mask > 128).astype(np.float32)
-    # Wide feather so the transition from original subject to lifted background is smooth
-    feather = max(int(min(h, w) * 0.015), 11)
-    feather = feather + (1 - feather % 2)
-    subj_f = cv2.GaussianBlur(subj_f, (feather, feather), 0)[:, :, np.newaxis]
+    subj_f = cv2.GaussianBlur(subj_f, (3, 3), 0)[:, :, np.newaxis]
     result = subj_f * img.astype(np.float32) + (1 - subj_f) * result
 
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
-# ── Technique 3: Floor replacement ──
-def replace_floor(img, bg_mask, subject_mask, floor_mask, floor_start, darken=0.8):
-    """Replace the floor area with a gradient from wall color."""
+# ── Technique 2: Frequency separation ──
+def freq_separation(img, bg_mask, floor_mask, subject_mask, strength=0.7):
+    """
+    Remove high-frequency detail (marks, scuffs, wrinkles, texture) from the wall
+    while keeping the low-frequency lighting gradient intact.
+    strength: 0 = no smoothing, 1 = full texture removal
+    """
     h, w = img.shape[:2]
-    if np.sum(floor_mask) == 0:
-        return img
+    work = bg_mask.copy()
+    work[floor_mask > 0] = 0
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    if np.sum(work) < 100:
+        return img.copy()
 
-    # Sample wall color from clean area just above floor
-    wall_zone = bg_mask.copy()
-    wall_zone[floor_mask > 0] = 0
-    wall_zone[:max(0, floor_start - int(h * 0.15)), :] = 0  # just above the floor
-    wall_pixels = img[wall_zone > 0]
-    if len(wall_pixels) < 50:
-        wall_zone = bg_mask.copy()
-        wall_zone[floor_mask > 0] = 0
-        wall_pixels = img[wall_zone > 0]
-    if len(wall_pixels) < 50:
-        return img
+    # Low-freq = heavy Gaussian blur (the gradient/lighting)
+    # Sigma scales with image size - larger image = need larger sigma
+    sigma = max(min(h, w) // 40, 10)
 
-    brightness = np.mean(wall_pixels, axis=1)
-    clean_wall = np.median(wall_pixels[brightness > np.percentile(brightness, 60)], axis=0).astype(np.float32)
+    # Weighted blur: only average from background pixels so subject doesn't bleed in
+    img_f = img.astype(np.float32)
+    wm = work.astype(np.float32)
+    wm3 = wm[:, :, np.newaxis]
 
-    # Build gradient for floor area
-    result = img.astype(np.float32).copy()
-    floor_h = h - floor_start
-    if floor_h <= 0:
-        return img
+    weighted = img_f * wm3
+    weight = wm3.copy()
 
-    for y in range(floor_start, h):
-        t = (y - floor_start) / max(floor_h, 1)
-        # Smooth gradient: starts at wall color, darkens toward bottom
-        color = clean_wall * (1.0 - (1.0 - darken) * (t ** 0.6))
-        # Only replace floor background pixels
-        floor_row = (floor_mask[y, :] > 0) & (subject_mask[y, :] < 128)
-        result[y, floor_row] = color
+    ksize = int(sigma * 6) | 1  # 6*sigma, make odd
+    low_freq = cv2.GaussianBlur(weighted, (ksize, ksize), sigma)
+    low_weight = cv2.GaussianBlur(weight, (ksize, ksize), sigma)
+    low_weight = np.maximum(low_weight, 1e-6)
+    low_freq = low_freq / low_weight
 
-    # Also fill the baseboard/bar zone (dark area right at transition)
-    bar_zone = max(0, floor_start - int(h * 0.02))
-    for y in range(bar_zone, min(floor_start + int(h * 0.02), h)):
-        t = max(0, (y - floor_start)) / max(floor_h, 1)
-        color = clean_wall * (1.0 - (1.0 - darken) * max(0, t ** 0.6))
-        dark_here = (gray[y, :] < np.mean(clean_wall) * 0.6)
-        replace_px = dark_here & (bg_mask[y, :] > 0) & (subject_mask[y, :] < 128)
-        result[y, replace_px] = color
+    # High-freq = original - low_freq (the texture/marks/detail)
+    # Removing high-freq = just using low_freq on the background
 
-    # Feather the transition
-    result_u8 = np.clip(result, 0, 255).astype(np.uint8)
-    blended = cv2.GaussianBlur(result_u8, (1, 31), 0)
+    # Blend: strength controls how much texture is removed
+    # 0 = original, 1 = fully smoothed (low_freq only)
+    result = img_f.copy()
+    blend = (wm * strength)[:, :, np.newaxis]
+    result = result * (1 - blend) + low_freq * blend
 
-    # Only apply blur at the transition zone
-    trans_mask = np.zeros((h, w), dtype=np.float32)
-    trans_top = max(0, floor_start - 15)
-    trans_bot = min(h, floor_start + 15)
-    for y in range(trans_top, trans_bot):
-        trans_mask[y, :] = 1.0 - abs(y - floor_start) / 15.0
-    trans_mask = np.clip(trans_mask, 0, 1)
-    trans_3 = trans_mask[:, :, np.newaxis]
-    result_u8 = (trans_3 * blended.astype(np.float32) +
-                  (1 - trans_3) * result_u8.astype(np.float32))
-
-    # Protect subject
+    # Subject composite - tight edge
     subj_f = (subject_mask > 128).astype(np.float32)
     subj_f = cv2.GaussianBlur(subj_f, (3, 3), 0)[:, :, np.newaxis]
-    final = subj_f * img.astype(np.float32) + (1 - subj_f) * result_u8
-    return np.clip(final, 0, 255).astype(np.uint8)
+    result = subj_f * img_f + (1 - subj_f) * result
+
+    return np.clip(result, 0, 255).astype(np.uint8)
 
 
 HTML = """
@@ -331,7 +209,7 @@ HTML = """
 <title>Clean Backdrop</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a1a; color: #e0e0e0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a1a; color: #e0e0e0; }
 .header { padding: 12px 20px; background: #222; border-bottom: 1px solid #333; display: flex; align-items: center; gap: 20px; }
 .header h1 { font-size: 18px; font-weight: 600; }
 .main { display: flex; height: calc(100vh - 49px); }
@@ -363,8 +241,6 @@ input[type=checkbox] { accent-color: #4a9eff; }
 input[type=text] { width:100%; padding:6px 8px; background:#2a2a2a; border:1px solid #444; border-radius:4px; color:#e0e0e0; font-size:11px; }
 #loading { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:100; align-items:center; justify-content:center; }
 #loading.on { display:flex; }
-.technique-box { background: #2a2a2a; border-radius: 6px; padding: 10px; margin-bottom: 8px; }
-.technique-box h4 { font-size: 12px; margin-bottom: 6px; color: #ccc; }
 </style>
 </head>
 <body>
@@ -388,38 +264,36 @@ input[type=text] { width:100%; padding:6px 8px; background:#2a2a2a; border:1px s
             <h3>View</h3>
             <div class="tabs">
                 <div class="tab on" data-v="original" onclick="view('original')">Original</div>
-                <div class="tab" data-v="preview" onclick="view('preview')">Preview</div>
-                <div class="tab" data-v="marks" onclick="view('marks')">Marks</div>
                 <div class="tab" data-v="shadows" onclick="view('shadows')">Shadows</div>
+                <div class="tab" data-v="texture" onclick="view('texture')">Texture</div>
+                <div class="tab" data-v="preview" onclick="view('preview')">Preview</div>
             </div>
         </div>
 
         <div class="section">
-            <h3>1. Marks &amp; Blemishes (LaMa)</h3>
-            <div class="check-row"><input type="checkbox" id="doMarks" checked><label for="doMarks">Enable</label></div>
-            <div class="control">
-                <label>Sensitivity <span id="sensV">10</span></label>
-                <input type="range" id="sens" min="3" max="30" value="10" oninput="document.getElementById('sensV').textContent=this.value">
-            </div>
-        </div>
-
-        <div class="section">
-            <h3>2. Shadow Lift</h3>
+            <h3>1. Shadow Lift</h3>
             <div class="check-row"><input type="checkbox" id="doShadow" checked><label for="doShadow">Enable</label></div>
             <div class="control">
-                <label>Lift strength <span id="liftV">70</span>%</label>
-                <input type="range" id="lift" min="0" max="100" value="70" oninput="document.getElementById('liftV').textContent=this.value">
+                <label>Strength <span id="liftV">70</span>%</label>
+                <input type="range" id="lift" min="0" max="100" value="70"
+                    oninput="document.getElementById('liftV').textContent=this.value">
             </div>
         </div>
 
-        <!-- Floor replacement removed - keeping original floor -->
-
+        <div class="section">
+            <h3>2. Texture Smoothing</h3>
+            <div class="check-row"><input type="checkbox" id="doTexture" checked><label for="doTexture">Enable</label></div>
+            <div class="control">
+                <label>Smoothing <span id="texV">50</span>%</label>
+                <input type="range" id="tex" min="0" max="100" value="50"
+                    oninput="document.getElementById('texV').textContent=this.value">
+            </div>
+        </div>
 
         <div class="section">
             <h3>Process</h3>
-            <button class="btn btn-blue" id="prevBtn" onclick="doPreview()" disabled>Preview All</button>
-            <button class="btn btn-blue" id="runBtn" onclick="doProcess()" disabled>Apply (Full Res)</button>
-            <button class="btn btn-grey" id="saveBtn" onclick="doSave()" disabled>Save</button>
+            <button class="btn btn-blue" id="prevBtn" onclick="doPreview()" disabled>Preview</button>
+            <button class="btn btn-grey" id="saveBtn" onclick="doSave()" disabled>Save Full Resolution</button>
             <div class="status" id="status"></div>
         </div>
     </div>
@@ -437,7 +311,11 @@ let curView = 'original';
 function view(v) {
     curView = v;
     document.querySelectorAll('[data-v]').forEach(t => t.classList.toggle('on', t.dataset.v === v));
-    if (imgs[v]) { document.getElementById('img').src = 'data:image/jpeg;base64,' + imgs[v]; document.getElementById('img').style.display='block'; document.getElementById('ph').style.display='none'; }
+    if (imgs[v]) {
+        document.getElementById('img').src = 'data:image/jpeg;base64,' + imgs[v];
+        document.getElementById('img').style.display='block';
+        document.getElementById('ph').style.display='none';
+    }
 }
 
 function loading(msg) { document.getElementById('loadMsg').textContent=msg||'Processing...'; document.getElementById('loading').classList.add('on'); }
@@ -445,21 +323,21 @@ function loaded() { document.getElementById('loading').classList.remove('on'); }
 function status(s) { document.getElementById('status').textContent=s; }
 
 function params() { return {
-    do_marks: document.getElementById('doMarks').checked,
-    sensitivity: +document.getElementById('sens').value,
     do_shadow: document.getElementById('doShadow').checked,
     lift: +document.getElementById('lift').value / 100,
+    do_texture: document.getElementById('doTexture').checked,
+    tex_strength: +document.getElementById('tex').value / 100,
 };}
 
-// Drop handling
 function handleDrop(file) {
     loading('Finding ' + file.name + '...');
     fetch('/find_load', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({filename:file.name}) })
     .then(r=>r.json()).then(d => { loaded(); if(d.error){alert(d.error);return;}
         imgs = {original: d.image}; document.getElementById('imageInfo').textContent=d.info;
         document.getElementById('pathInput').value=d.path||'';
-        document.getElementById('prevBtn').disabled=false; document.getElementById('runBtn').disabled=false;
+        document.getElementById('prevBtn').disabled=false;
         view('original');
+        doPreview();
     }).catch(e=>{loaded();alert(e);});
 }
 
@@ -480,32 +358,25 @@ function loadPath() {
     .then(r=>r.json()).then(d=>{loaded();if(d.error){alert(d.error);return;}
         imgs={original:d.image}; document.getElementById('imageInfo').textContent=d.info;
         document.getElementById('pathInput').value=d.path||p;
-        document.getElementById('prevBtn').disabled=false; document.getElementById('runBtn').disabled=false;
+        document.getElementById('prevBtn').disabled=false;
         view('original');
+        doPreview();
     }).catch(e=>{loaded();alert(e);});
 }
 
 function doPreview() {
-    loading('Building preview...');
+    loading('Processing...');
     fetch('/preview', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(params())})
     .then(r=>r.json()).then(d=>{loaded();if(d.error){alert(d.error);return;}
-        imgs.preview=d.preview; imgs.marks=d.marks; imgs.shadows=d.shadows;
-        status(d.info); view('preview');
-    }).catch(e=>{loaded();alert(e);});
-}
-
-function doProcess() {
-    loading('Applying full resolution (may take a minute)...');
-    fetch('/process', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(params())})
-    .then(r=>r.json()).then(d=>{loaded();if(d.error){alert(d.error);return;}
-        imgs.preview=d.preview; document.getElementById('saveBtn').disabled=false;
+        imgs.preview=d.preview; imgs.shadows=d.shadows; imgs.texture=d.texture;
+        document.getElementById('saveBtn').disabled=false;
         status(d.info); view('preview');
     }).catch(e=>{loaded();alert(e);});
 }
 
 function doSave() {
-    loading('Saving...');
-    fetch('/save', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})})
+    loading('Saving full resolution...');
+    fetch('/save', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(params())})
     .then(r=>r.json()).then(d=>{loaded();if(d.error){alert(d.error);return;} status('Saved: '+d.path);})
     .catch(e=>{loaded();alert(e);});
 }
@@ -561,13 +432,15 @@ def _load(path):
     state["img"] = img
     state["img_path"] = path
 
-    # Segment
+    # Segment subject on GPU via birefnet-portrait
+    print(f"Segmenting {os.path.basename(path)} ({w}x{h})...")
     pil_img = Image.open(path).convert("RGB")
-    session = new_session("u2net_human_seg")
+    session = new_session("birefnet-portrait")
     sm = np.array(remove(pil_img, session=session, only_mask=True))
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     sm = cv2.morphologyEx(sm, cv2.MORPH_CLOSE, k, iterations=3)
-    sm = cv2.morphologyEx(sm, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
+    sm = cv2.morphologyEx(sm, cv2.MORPH_OPEN,
+                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
     state["subject_mask"] = sm
 
     pk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
@@ -577,6 +450,7 @@ def _load(path):
     fm, fs = detect_floor(img, state["bg_mask"])
     state["floor_mask"] = fm
     state["floor_start_row"] = fs
+    print(f"  Done. Floor: {'row ' + str(fs) if np.sum(fm) > 0 else 'none'}")
 
     preview = preview_resize(img)
     floor_info = f"floor at row {fs}" if np.sum(fm) > 0 else "no floor boundary"
@@ -594,113 +468,49 @@ def preview():
     current = img.copy()
     info_parts = []
 
-    # Technique 2: Shadow lift (do before marks so LaMa sees lifted image)
-    shadow_vis = None
+    # Step 1: Shadow lift
+    shadows_vis = None
     if p.get("do_shadow"):
-        current = compute_shadow_lift(current, state["bg_mask"], state["floor_mask"],
-                                       state["subject_mask"], strength=p.get("lift", 0.7))
-        # Visualization: diff between original and lifted
+        current = shadow_lift(current, state["bg_mask"], state["floor_mask"],
+                              state["subject_mask"], strength=p.get("lift", 0.7))
+        # Visualization
         diff = np.abs(current.astype(np.float32) - img.astype(np.float32))
-        diff_vis = img.copy()
-        changed = np.mean(diff, axis=2) > 5
+        diff_vis = current.copy()
+        changed = np.mean(diff, axis=2) > 3
         diff_vis[changed] = [0, 165, 255]
-        shadow_vis = preview_resize(cv2.addWeighted(img, 0.5, diff_vis, 0.5, 0))
-        info_parts.append("shadows lifted")
+        shadows_vis = preview_resize(cv2.addWeighted(img, 0.4, diff_vis, 0.6, 0))
+        info_parts.append(f"shadows {int(p.get('lift', 0.7)*100)}%")
 
-    # Technique 1: Marks detection (show mask, don't inpaint yet for preview speed)
-    marks_vis = None
-    if p.get("do_marks"):
-        marks_mask = detect_marks(current, state["bg_mask"], state["floor_mask"],
-                                   sensitivity=p.get("sensitivity", 15))
-        marks_mask[state["subject_mask"] > 128] = 0
-        cov = np.sum(marks_mask > 0) / (h * w) * 100
-        overlay = current.copy()
-        overlay[marks_mask > 128] = [0, 165, 255]
-        marks_vis = preview_resize(cv2.addWeighted(current, 0.5, overlay, 0.5, 0))
-        info_parts.append(f"marks: {cov:.1f}%")
+    # Step 2: Frequency separation (texture smoothing)
+    texture_vis = None
+    if p.get("do_texture"):
+        current = freq_separation(current, state["bg_mask"], state["floor_mask"],
+                                   state["subject_mask"], strength=p.get("tex_strength", 0.5))
+        # Visualization: show what was removed (high-freq component)
+        removed = np.abs(current.astype(np.float32) - (img if not p.get("do_shadow") else
+                         shadow_lift(img, state["bg_mask"], state["floor_mask"],
+                                     state["subject_mask"], strength=p.get("lift", 0.7))).astype(np.float32))
+        tex_vis = current.copy()
+        tex_changed = np.mean(removed, axis=2) > 2
+        tex_vis[tex_changed] = [255, 165, 0]
+        texture_vis = preview_resize(cv2.addWeighted(current, 0.4, tex_vis, 0.6, 0))
+        info_parts.append(f"texture {int(p.get('tex_strength', 0.5)*100)}%")
 
-    # Final subject composite
-    sf = state["subject_mask"].astype(np.float32) / 255.0
-    sf = cv2.GaussianBlur(sf, (3, 3), 0)[:, :, np.newaxis]
-    final = (sf * img.astype(np.float32) + (1 - sf) * current.astype(np.float32))
-    final = np.clip(final, 0, 255).astype(np.uint8)
+    state["last_result"] = current
 
     return jsonify({
-        "preview": to_b64(preview_resize(final)),
-        "marks": to_b64(marks_vis) if marks_vis is not None else to_b64(preview_resize(img)),
-        "shadows": to_b64(shadow_vis) if shadow_vis is not None else to_b64(preview_resize(img)),
-        "info": " | ".join(info_parts) if info_parts else "No techniques enabled",
-    })
-
-
-@app.route('/process', methods=['POST'])
-def process_full():
-    if state["img"] is None:
-        return jsonify({"error": "No image loaded"})
-
-    p = request.json
-    img = state["img"]
-    h, w = img.shape[:2]
-    current = img.copy()
-    info_parts = []
-
-    # Technique 2: Shadow lift (same as preview)
-    if p.get("do_shadow"):
-        current = compute_shadow_lift(current, state["bg_mask"], state["floor_mask"],
-                                       state["subject_mask"], strength=p.get("lift", 0.7))
-        info_parts.append("shadows lifted")
-
-    # Subject composite (sharp - minimal feather)
-    sf = state["subject_mask"].astype(np.float32) / 255.0
-    sf = cv2.GaussianBlur(sf, (3, 3), 0)[:, :, np.newaxis]
-    final = (sf * img.astype(np.float32) + (1 - sf) * current.astype(np.float32))
-    final = np.clip(final, 0, 255).astype(np.uint8)
-
-    # Technique 1: LaMa on marks ONLY if enabled - very conservative
-    if p.get("do_marks"):
-        marks_mask = detect_marks(final, state["bg_mask"], state["floor_mask"],
-                                   sensitivity=p.get("sensitivity", 10))
-        marks_mask[state["subject_mask"] > 128] = 0
-        cov = np.sum(marks_mask > 0) / (h * w) * 100
-
-        # Hard cap at 5% - LaMa should only touch tiny isolated marks
-        if cov > 5:
-            marks_mask = detect_marks(final, state["bg_mask"], state["floor_mask"],
-                                       sensitivity=max(p.get("sensitivity", 10) * 3, 25))
-            marks_mask[state["subject_mask"] > 128] = 0
-            cov = np.sum(marks_mask > 0) / (h * w) * 100
-
-        if cov > 0.1 and cov <= 5:
-            print(f"  LaMa on {cov:.1f}% marks")
-            model, device = get_lama()
-            max_dim = 3072
-            scale = min(max_dim / max(h, w), 1.0)
-            if scale < 1.0:
-                sh, sw = int(h * scale), int(w * scale)
-                lr = run_lama(cv2.resize(final, (sw, sh), interpolation=cv2.INTER_AREA),
-                              cv2.resize(marks_mask, (sw, sh), interpolation=cv2.INTER_NEAREST), model, device)
-                lr = cv2.resize(lr, (w, h), interpolation=cv2.INTER_LANCZOS4)
-            else:
-                lr = run_lama(final, marks_mask, model, device)
-            mf = (marks_mask > 128).astype(np.float32)
-            mf = cv2.GaussianBlur(mf, (3, 3), 0)[:, :, np.newaxis]
-            final = (mf * lr.astype(np.float32) + (1 - mf) * final.astype(np.float32))
-            final = np.clip(final, 0, 255).astype(np.uint8)
-            info_parts.append(f"marks healed ({cov:.1f}%)")
-        else:
-            info_parts.append(f"marks skipped ({cov:.1f}% - {'too many' if cov > 5 else 'none found'})")
-
-    state["last_result"] = final
-    return jsonify({
-        "preview": to_b64(preview_resize(final)),
-        "info": " | ".join(info_parts) if info_parts else "Processed",
+        "preview": to_b64(preview_resize(current)),
+        "shadows": to_b64(shadows_vis) if shadows_vis is not None else to_b64(preview_resize(img)),
+        "texture": to_b64(texture_vis) if texture_vis is not None else to_b64(preview_resize(img)),
+        "info": " | ".join(info_parts) if info_parts else "No processing",
     })
 
 
 @app.route('/save', methods=['POST'])
 def save():
     if state.get("last_result") is None:
-        return jsonify({"error": "Run process first"})
+        return jsonify({"error": "Run preview first"})
+
     path = state["img_path"]
     base, ext = os.path.splitext(path)
     out = f"{base}_clean{ext}"
@@ -726,6 +536,6 @@ def save():
 
 
 if __name__ == '__main__':
-    print("\n  Clean Backdrop v2")
+    print("\n  Clean Backdrop")
     print("  http://localhost:5000\n")
     app.run(host='0.0.0.0', port=5000, debug=False)
