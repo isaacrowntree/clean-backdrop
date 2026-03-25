@@ -20,6 +20,12 @@ Two complementary techniques:
 
 Both techniques use **birefnet-portrait** for subject segmentation (state-of-the-art edge quality) and run on GPU via CUDA.
 
+### Smart Edge Handling
+
+- **Smooth subject masking** - Distance-based feathering that scales with image size, eliminating hard "bar" artifacts at subject boundaries. No visible seams between processed background and subject.
+- **Automatic floor detection** - Distinguishes real floors (wood, tile) from wall shadow/vignetting using color analysis. Real floors are preserved; shadow darkening on walls is cleaned.
+- **Vertical floor transition** - Wall-to-floor boundary uses a row-based ramp so floor texture and contact shadows around feet are never disturbed.
+
 ## Web UI
 
 Local web interface with sliders and instant preview.
@@ -48,13 +54,16 @@ python batch.py /path/to/folder --lift 80 --texture 0
 
 # Custom output folder
 python batch.py "D:\Photos\shoot" --output retouched --lift 100 --texture 60
+
+# Disable floor detection (treat everything as wall)
+python batch.py /path/to/folder --no-floor
 ```
 
 ## Requirements
 
 - Python 3.10+
-- NVIDIA GPU (CUDA) - used for segmentation and processing
-- `onnxruntime-gpu` for GPU-accelerated subject segmentation
+- NVIDIA GPU with CUDA
+- cuDNN 9 (for GPU-accelerated segmentation via `onnxruntime-gpu`)
 - ~928MB for birefnet-portrait model (downloaded on first run)
 
 ## Installation
@@ -65,6 +74,22 @@ cd clean-backdrop
 pip install -r requirements.txt
 pip install onnxruntime-gpu  # for GPU segmentation
 ```
+
+### cuDNN Setup
+
+ONNX Runtime needs `libcudnn.so.9` on `LD_LIBRARY_PATH`. If you see a `libcudnn.so.9: cannot open shared object file` error, find and export the path:
+
+```bash
+# Find cuDNN on your system
+find /usr -name "libcudnn.so.9" 2>/dev/null
+find /usr/local -name "libcudnn.so.9" 2>/dev/null
+
+# Add to your shell profile (adjust path to match your system)
+echo 'export LD_LIBRARY_PATH="/path/to/cudnn/lib:$LD_LIBRARY_PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+Without cuDNN, segmentation falls back to CPU (slower but still works).
 
 ## License
 

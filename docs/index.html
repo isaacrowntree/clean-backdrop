@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Clean Backdrop - Free AI Studio Background Retouching</title>
+<title>Clean Backdrop - Free Studio Background Retouching</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #1a1a2e; background: #fff; line-height: 1.6; }
@@ -75,7 +75,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
     background: #f8f9fa;
 }
 .techniques h2 { text-align: center; font-size: 32px; margin-bottom: 40px; }
-.tech-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px; max-width: 1000px; margin: 0 auto; }
+.tech-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px; max-width: 1000px; margin: 0 auto; }
 .tech-card {
     background: white;
     border-radius: 12px;
@@ -176,12 +176,17 @@ footer a { color: #4a9eff; text-decoration: none; }
             <div class="tech-card">
                 <div class="num">Technique 2</div>
                 <h3>Texture Smoothing</h3>
-                <p>Frequency separation splits the image into lighting gradient and surface texture. Smooths out marks, scuffs, and wrinkles while keeping the natural light falloff. No AI artifacts, no smudging &mdash; just math.</p>
+                <p>Frequency separation splits the image into lighting gradient and surface texture. Smooths out marks, scuffs, and wrinkles while keeping the natural light falloff. No AI artifacts, no smudging.</p>
             </div>
             <div class="tech-card">
                 <div class="num">Technique 3</div>
-                <h3>Subject Protection</h3>
-                <p>rembg segmentation ensures the subject is never modified. Sharp edges with minimal feathering &mdash; no ghosting, no color bleed. ICC profiles and EXIF metadata preserved.</p>
+                <h3>Smooth Subject Masking</h3>
+                <p>birefnet-portrait segmentation with distance-based feathering that scales with image size. No hard edges, no halos, no bars &mdash; seamless transitions between subject and processed background.</p>
+            </div>
+            <div class="tech-card">
+                <div class="num">Technique 4</div>
+                <h3>Smart Floor Detection</h3>
+                <p>Automatically detects real floors (wood, tile) vs wall shadow using color analysis. Real floors are preserved with smooth vertical transitions. Contact shadows around feet stay natural.</p>
             </div>
         </div>
     </div>
@@ -198,12 +203,17 @@ footer a { color: #4a9eff; text-decoration: none; }
             </div>
             <div class="install-step">
                 <span class="comment"># Install dependencies</span><br>
-                <span class="cmd">pip install -r requirements.txt</span>
+                <span class="cmd">pip install -r requirements.txt</span><br>
+                <span class="cmd">pip install onnxruntime-gpu</span>
             </div>
             <div class="install-step">
                 <span class="comment"># Launch the web UI</span><br>
                 <span class="cmd">python app.py</span><br>
                 <span class="comment"># Open http://localhost:5000</span>
+            </div>
+            <div class="install-step">
+                <span class="comment"># Or batch process a folder</span><br>
+                <span class="cmd">python batch.py "D:\Photos\My Shoot" --lift 70 --texture 50</span>
             </div>
         </div>
     </div>
