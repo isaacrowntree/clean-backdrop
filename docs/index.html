@@ -125,10 +125,10 @@ footer a { color: #4a9eff; text-decoration: none; }
 
 <div class="hero">
     <h1>Clean Backdrop</h1>
-    <p>Free, open-source AI tool to clean studio photo backdrops. Remove shadows, marks, and blemishes while preserving the subject perfectly.</p>
+    <p>Free, open-source tool to clean studio photo backdrops. Remove shadows and smooth marks using frequency separation. No AI inpainting artifacts.</p>
     <div class="badges">
         <span class="badge badge-blue">Shadow Lift</span>
-        <span class="badge badge-green">LaMa Inpainting</span>
+        <span class="badge badge-green">Frequency Separation</span>
         <span class="badge badge-purple">GPU Accelerated</span>
     </div>
     <div class="cta-buttons">
@@ -175,8 +175,8 @@ footer a { color: #4a9eff; text-decoration: none; }
             </div>
             <div class="tech-card">
                 <div class="num">Technique 2</div>
-                <h3>Marks & Blemishes</h3>
-                <p>LaMa AI inpainting targets only small isolated marks &mdash; wrinkles, scuffs, seams, dust. Capped at 5% of the image to prevent smudging. Your 4070 Ti processes it in seconds.</p>
+                <h3>Texture Smoothing</h3>
+                <p>Frequency separation splits the image into lighting gradient and surface texture. Smooths out marks, scuffs, and wrinkles while keeping the natural light falloff. No AI artifacts, no smudging &mdash; just math.</p>
             </div>
             <div class="tech-card">
                 <div class="num">Technique 3</div>
@@ -202,7 +202,7 @@ footer a { color: #4a9eff; text-decoration: none; }
             </div>
             <div class="install-step">
                 <span class="comment"># Launch the web UI</span><br>
-                <span class="cmd">python app_v2.py</span><br>
+                <span class="cmd">python app.py</span><br>
                 <span class="comment"># Open http://localhost:5000</span>
             </div>
         </div>
