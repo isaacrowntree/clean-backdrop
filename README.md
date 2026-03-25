@@ -6,9 +6,6 @@ An alternative to paid tools like Retouch4me Clean Backdrop.
 
 ### Before & After
 
-![Before and After](docs/example_preview.jpg)
-*Left: Original with cast shadow and wall marks. Right: Shadow lifted, marks cleaned.*
-
 | Before | After |
 |--------|-------|
 | ![Before](docs/before.jpg) | ![After](docs/after.jpg) |
