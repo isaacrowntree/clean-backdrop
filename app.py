@@ -106,6 +106,16 @@ def detect_floor(img, bg_mask):
                 floor_start = h // 2 + cands[0]
                 floor_mask[floor_start:, :] = bg_mask[floor_start:, :]
 
+    # Feather the top edge of the floor mask so cleanup ramps down gradually
+    # instead of hard-stopping (which creates a visible seam)
+    if np.sum(floor_mask) > 0:
+        feather_px = max(int(h * 0.05), 30)  # 5% of height, min 30px
+        floor_float = floor_mask.astype(np.float32)
+        for r in range(max(floor_start - feather_px, 0), floor_start):
+            t = (r - (floor_start - feather_px)) / feather_px
+            floor_float[r, :] = bg_mask[r, :].astype(np.float32) * t
+        floor_mask = floor_float
+
     return floor_mask, floor_start
 
 
@@ -123,14 +133,14 @@ def shadow_lift(img, bg_mask, floor_mask, subject_mask, strength=0.7):
     """Blend shadows toward clean wall color. Preserves gradient shape."""
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    work = bg_mask.copy()
-    work[floor_mask > 0] = 0
+    floor_f = floor_mask.astype(np.float32) if floor_mask.dtype != np.float32 else floor_mask
+    work = bg_mask.astype(np.float32) * (1.0 - np.clip(floor_f, 0, 1))
 
-    if np.sum(work) < 100:
+    if np.sum(work > 0.5) < 100:
         return img.copy()
 
-    # Clean wall color from brightest bg pixels
-    wall_pixels = img[work > 0]
+    # Clean wall color from brightest bg pixels (use binary mask for sampling)
+    wall_pixels = img[work > 0.5]
     brightness = np.mean(wall_pixels, axis=1)
     bright_pixels = wall_pixels[brightness > np.percentile(brightness, 80)]
     if len(bright_pixels) < 10:
@@ -143,7 +153,7 @@ def shadow_lift(img, bg_mask, floor_mask, subject_mask, strength=0.7):
     max_depth = clean_brightness * 0.5
     shadow_amount = np.clip(darkness / max(max_depth, 1), 0, 1) * strength
 
-    shadow_amount[work == 0] = 0
+    shadow_amount = shadow_amount * work
 
     # Wide blur for smooth transition
     blur_size = max(int(min(h, w) * 0.06), 51)
@@ -172,10 +182,10 @@ def freq_separation(img, bg_mask, floor_mask, subject_mask, strength=0.7):
     strength: 0 = no smoothing, 1 = full texture removal
     """
     h, w = img.shape[:2]
-    work = bg_mask.copy()
-    work[floor_mask > 0] = 0  # exclude floor - it has intentional texture
+    floor_f = floor_mask.astype(np.float32) if floor_mask.dtype != np.float32 else floor_mask
+    work = bg_mask.astype(np.float32) * (1.0 - np.clip(floor_f, 0, 1))
 
-    if np.sum(work) < 100:
+    if np.sum(work > 0.5) < 100:
         return img.copy()
 
     # Low-freq = heavy Gaussian blur (the gradient/lighting)
@@ -199,7 +209,7 @@ def freq_separation(img, bg_mask, floor_mask, subject_mask, strength=0.7):
     # Blend: strength controls how much texture is removed
     # Smooth ramp near subject replaces hard subject composite
     smooth = _smooth_bg_mask(subject_mask, h, w)
-    smooth[floor_mask > 0] = 0  # exclude floor same as work mask
+    smooth = smooth * (1.0 - np.clip(floor_f, 0, 1))  # feathered floor exclusion
     result = img_f.copy()
     blend = (smooth * strength)[:, :, np.newaxis]
     result = result * (1 - blend) + low_freq * blend
@@ -457,10 +467,10 @@ def _load(path):
     fm, fs = detect_floor(img, state["bg_mask"])
     state["floor_mask"] = fm
     state["floor_start_row"] = fs
-    print(f"  Done. Floor: {'row ' + str(fs) if np.sum(fm) > 0 else 'none'}")
+    print(f"  Done. Floor: {'row ' + str(fs) if np.any(fm > 0) else 'none'}")
 
     preview = preview_resize(img)
-    floor_info = f"floor at row {fs}" if np.sum(fm) > 0 else "no floor boundary"
+    floor_info = f"floor at row {fs}" if np.any(fm > 0) else "no floor boundary"
     return jsonify({"image": to_b64(preview), "info": f"{w}x{h} | {floor_info}", "path": path})
 
 
